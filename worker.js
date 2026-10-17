@@ -85,15 +85,41 @@ async function buscar(w, desde) {
   return null;
 }
 
-async function avisar(topico, titulo, corpo, tag) {
+async function avisar(topico, titulo, corpo, tag, click) {
+  // formato JSON: aceita acentos e qualquer letra no título
   try {
+    const r = await fetch("https://ntfy.sh", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ topic: topico, title: titulo, message: corpo, tags: [tag], ...(click ? { click } : {}) }),
+    });
+    if (r.ok) return true;
+    console.error("ntfy (json) respondeu " + r.status + " (topico ..." + topico.slice(-4) + ")");
+  } catch (e) { console.error("ntfy (json) falhou: " + e); }
+  // reserva: formato simples, com o título só em caracteres básicos
+  try {
+    const t = titulo.normalize("NFD").replace(/[^\x20-\x7E]/g, "").trim() || "Aviso";
     const r = await fetch("https://ntfy.sh/" + encodeURIComponent(topico), {
-      method: "POST", headers: { "Title": titulo, "Tags": tag }, body: corpo,
+      method: "POST", headers: { "Title": t, "Tags": tag }, body: corpo,
     });
     if (!r.ok) console.error("ntfy respondeu " + r.status + " (topico ..." + topico.slice(-4) + ")");
     return r.ok;
   } catch (e) { console.error("ntfy falhou: " + e); return false; }
 }
+
+// junta as execuções fracionadas: uma aposta (carteira + mercado + lado) vira UM aviso com o total
+function agrupar(novas) {
+  const grupos = new Map();
+  for (const { c, t } of novas) {
+    const k = [c.w, t.conditionId, t.outcome, String(t.side || "").toUpperCase()].join("|");
+    let g = grupos.get(k);
+    if (!g) { g = { c, t, n: 0, cotas: 0, custo: 0 }; grupos.set(k, g); }
+    const size = Number(t.size) || 0, preco = Number(t.price) || 0;
+    g.n++; g.cotas += size; g.custo += size * preco;
+  }
+  return [...grupos.values()].sort((x, y) => y.custo - x.custo);
+}
+const moeda = v => "US$ " + v.toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+const MAX_AVISOS = 8; // por rodada; o que passar disso vira um aviso-resumo
 
 async function vigiar(env) {
   const cfg = JSON.parse((await env.CFG.get("cfg")) || "null");
@@ -134,15 +160,22 @@ async function vigiar(env) {
       lista = novas.filter(x => paraMs(x.t.timestamp) >= corte);
     }
   }
-  for (const { c, t } of lista.slice(0, 5)) {
-    const preco = Number(t.price) || 0;
-    const valor = (Number(t.size) || 0) * preco;
-    const odd = preco > 0 ? (1 / preco).toFixed(2) : "-";
-    const lado = String(t.side || "").toUpperCase() === "SELL" ? "vendeu" : "comprou";
-    const nome = c.nome || (c.w.slice(0, 6) + "..." + c.w.slice(-4));
-    const corpo = `${nome}: ${lado} ${t.outcome || "?"}\n${t.title || t.slug || ""}\nvalor US$ ${valor.toFixed(2)} · odd ${odd}`;
-    const ok = await avisar(cfg.topico, "Nova aposta - carteira monitorada", corpo, "bell");
+  const grupos = agrupar(lista);
+  resumo.grupos = grupos.length;
+  for (const g of grupos.slice(0, MAX_AVISOS)) {
+    const t = g.t;
+    const pm = g.cotas > 0 ? g.custo / g.cotas : 0; // preço médio ponderado pelo tamanho
+    const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
+    const venda = String(t.side || "").toUpperCase() === "SELL";
+    const nome = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
+    const titulo = `${nome}: ${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
+    const corpo = `${t.title || t.slug || ""}\n${moeda(g.custo)}${g.n > 1 ? ` em ${g.n} execuções` : ""} · odd ${odd}`;
+    const click = t.eventSlug ? "https://polymarket.com/event/" + t.eventSlug : "";
+    const ok = await avisar(cfg.topico, titulo, corpo, venda ? "red_circle" : "green_circle", click);
     if (ok) resumo.avisosOk++; else resumo.avisosFalha++;
+  }
+  if (grupos.length > MAX_AVISOS) {
+    await avisar(cfg.topico, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez. Abra a página para ver todas.", "bell");
   }
   // números importantes primeiro, para aparecerem na lista mesmo com o texto cortado
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
