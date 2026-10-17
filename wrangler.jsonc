@@ -6,5 +6,6 @@
     { "binding": "CFG", "id": "b1703649ef05417f934909597738ea8a" }
   ],
   "triggers": { "crons": ["* * * * *"] },
+  "keep_vars": true,
   "observability": { "enabled": true }
 }
