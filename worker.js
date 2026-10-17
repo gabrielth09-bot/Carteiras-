@@ -17,12 +17,13 @@ const MAX_CHAMADAS = 48;       // todas as chamadas externas da rodada; o plano 
 const MAX_AVISOS = 8;          // avisos de apostas por rodada; o resto vira um aviso-resumo
 const MAX_REENVIOS = 4;        // avisos atrasados reenviados por rodada
 const FILA_MAX = 50;           // avisos guardados até o ntfy aceitar
-const FILA_VALIDADE_MS = 60 * 60 * 1000; // aviso que ficou mais de 1 hora na fila é descartado
+const FILA_VALIDADE_MS = 3 * 60 * 60 * 1000; // aviso que ficou mais de 3 horas na fila é descartado
 const MAX_CHAVES = 600;        // apostas lembradas por carteira
 const ESTADO = "estado2";      // apostas já tratadas (mesmo nome da versão anterior)
 const FILA = "fila1";          // avisos que o ntfy ainda não aceitou
 const vistosMem = {};          // memória desta instância: reserva caso o KV falhe
 let travaMs = 0;               // impede duas rodadas ao mesmo tempo nesta instância
+let v2PausaAte = 0;            // depois de um 429 da v2, a v2 fica de fora por 2 minutos (a v1 responde)
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -102,6 +103,7 @@ async function pedir(run, url, tentativas) {
       const r = await fetch(url, { signal: ctrl.signal, headers: { Accept: "application/json" } });
       if (r.ok) return await r.json();
       motivo = "HTTP " + r.status;
+      if (r.status === 429) { if (url.includes("/v2/")) v2PausaAte = Date.now() + 120000; break; } // limite de acesso: repetir agora não adianta
       if ([400, 401, 403, 404].includes(r.status)) break; // erro definitivo: repetir não adianta
     } catch (e) {
       motivo = e && e.name === "AbortError" ? "tempo esgotado" : String(e);
@@ -116,6 +118,7 @@ async function pedir(run, url, tentativas) {
 // v2 primeiro (seguindo o cursor); se a primeira página falhar, usa a v1 como reserva
 async function buscar(run, w, desde) {
   try {
+    if (Date.now() < v2PausaAte) throw new Error("v2 em pausa (limite de acesso)");
     const esports = []; let total = 0, cursor = null, parcial = false;
     for (let p = 0; p < MAX_PAGINAS; p++) {
       let url = `${DATA}/v2/trades?user=${w}&limit=${LIMITE}&start=${desde}`;
@@ -294,7 +297,7 @@ async function vigiar(env, minuto) {
     if (agora - a.ts > FILA_VALIDADE_MS) { resumo.descartados++; continue; }
     if (tentados < MAX_REENVIOS && !run.bloqueado) {
       tentados++;
-      if (await avisar(run, cfg.topico, a)) { resumo.reenviados++; continue; }
+      if (await avisar(run, cfg.topico, { ...a, corpo: "(atrasado) " + a.corpo })) { resumo.reenviados++; continue; }
     }
     pendentes.push(a);
   }
@@ -356,7 +359,15 @@ export default {
       for (const w of Object.keys(estado)) if (!manter.has(w)) { delete estado[w]; limpou = true; }
       if (limpou) await env.CFG.put(ESTADO, JSON.stringify(estado));
       // confirmação só quando a configuração muda (a página pode sincronizar várias vezes)
-      if (topico && carteiras.length) await avisar(novoRun(), topico, { titulo: "Servidor sincronizado", corpo: "Vigiando " + carteiras.length + " carteira(s) a cada minuto, mesmo com a página fechada.", tag: "white_check_mark", click: "" });
+      if (topico && carteiras.length) {
+        const sync = { ts: Date.now(), titulo: "Servidor sincronizado", corpo: "Vigiando " + carteiras.length + " carteira(s) a cada minuto, mesmo com a página fechada.", tag: "white_check_mark", click: "" };
+        // se o ntfy recusar agora, a confirmação fica na fila e sai quando ele aceitar
+        if (!(await avisar(novoRun(), topico, sync))) {
+          const fila = lerFila(await env.CFG.get(FILA));
+          fila.push(sync);
+          await env.CFG.put(FILA, JSON.stringify(fila.slice(-FILA_MAX)));
+        }
+      }
     }
     return resp(JSON.stringify({ carteiras: carteiras.length }));
   },
