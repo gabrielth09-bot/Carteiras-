@@ -1,5 +1,6 @@
-// Worker: vigia as carteiras da Polymarket a cada 1 minuto e avisa pelo ntfy.
-// Precisa de: KV com binding "CFG", segredo "CHAVE" e Cron "* * * * *".
+// Worker: vigia as carteiras da Polymarket a cada 1 minuto e avisa pelo Telegram.
+// Precisa de: KV com binding "CFG", segredo "CHAVE", segredo "TELEGRAM_BOT_TOKEN",
+// variável "TELEGRAM_CHAT_ID" e Cron "* * * * *".
 // Usa a mesma consulta da página (Data API v2 primeiro, v1 como reserva).
 const DATA = "https://data-api.polymarket.com";
 const ESPORT = /^(lol|cs2?|csgo|dota2?|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|kog|hok|mlbb|sc2|starcraft)(?![a-z])/i;
@@ -85,25 +86,57 @@ async function buscar(w, desde) {
   return null;
 }
 
-async function avisar(topico, titulo, corpo, tag, click) {
-  // formato JSON: aceita acentos e qualquer letra no título
-  try {
-    const r = await fetch("https://ntfy.sh", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ topic: topico, title: titulo, message: corpo, tags: [tag], ...(click ? { click } : {}) }),
-    });
-    if (r.ok) return true;
-    console.error("ntfy (json) respondeu " + r.status + " (topico ..." + topico.slice(-4) + ")");
-  } catch (e) { console.error("ntfy (json) falhou: " + e); }
-  // reserva: formato simples, com o título só em caracteres básicos
-  try {
-    const t = titulo.normalize("NFD").replace(/[^\x20-\x7E]/g, "").trim() || "Aviso";
-    const r = await fetch("https://ntfy.sh/" + encodeURIComponent(topico), {
-      method: "POST", headers: { "Title": t, "Tags": tag }, body: corpo,
-    });
-    if (!r.ok) console.error("ntfy respondeu " + r.status + " (topico ..." + topico.slice(-4) + ")");
-    return r.ok;
-  } catch (e) { console.error("ntfy falhou: " + e); return false; }
+const EMOJI = { red_circle: "🔴", green_circle: "🟢", white_check_mark: "✅", warning: "⚠️", bell: "🔔" };
+const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const pausa = ms => new Promise(r => setTimeout(r, ms));
+
+// uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
+async function enviarTelegram(env, texto, html) {
+  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, link_preview_options: { is_disabled: true } };
+  if (html) corpo.parse_mode = "HTML";
+  const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo),
+  });
+  let d = null;
+  try { d = await r.json(); } catch (e) { /* resposta sem JSON */ }
+  return {
+    ok: r.ok && !!d && d.ok === true,
+    status: r.status,
+    desc: d && d.description ? String(d.description).slice(0, 120) : "",
+    espera: d && d.parameters && d.parameters.retry_after ? Number(d.parameters.retry_after) : 0,
+  };
+}
+
+async function avisar(env, titulo, corpo, tag, click) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    console.error("telegram: faltam TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID");
+    return false;
+  }
+  const emoji = EMOJI[tag] || EMOJI.bell;
+  const link = click ? "\n" + click : "";
+  const textoHtml = `${emoji} <b>${esc(titulo)}</b>\n${esc(corpo)}${esc(link)}`;
+  const textoPlano = `${emoji} ${titulo}\n${corpo}${link}`;
+  for (let tentativa = 0; tentativa < 2; tentativa++) {
+    try {
+      let r = await enviarTelegram(env, textoHtml, true);
+      // 400 = o Telegram não aceitou o formato: tenta de novo em texto simples
+      if (!r.ok && r.status === 400) r = await enviarTelegram(env, textoPlano, false);
+      if (r.ok) return true;
+      console.error("telegram respondeu " + r.status + (r.desc ? ": " + r.desc : ""));
+      // 429 (muitas mensagens) e 5xx (falha do Telegram): uma segunda tentativa; outros erros não adiantam repetir
+      if (tentativa === 0 && (r.status === 429 || r.status >= 500)) {
+        await pausa(Math.min(Math.max(r.espera, 1), 5) * 1000);
+        continue;
+      }
+      return false;
+    } catch (e) {
+      // o texto do erro pode, em tese, trazer a URL: o token é removido antes de gravar
+      console.error("telegram falhou: " + String(e).split(env.TELEGRAM_BOT_TOKEN).join("***"));
+      if (tentativa === 0) { await pausa(1000); continue; }
+      return false;
+    }
+  }
+  return false;
 }
 
 // junta as execuções fracionadas: uma aposta (carteira + mercado + lado) vira UM aviso com o total
@@ -123,10 +156,10 @@ const MAX_AVISOS = 8; // por rodada; o que passar disso vira um aviso-resumo
 
 async function vigiar(env) {
   const cfg = JSON.parse((await env.CFG.get("cfg")) || "null");
-  if (!cfg || !cfg.topico || !cfg.carteiras || !cfg.carteiras.length) { console.log("rodada: nada para vigiar (0 carteiras ou sem topico)"); return; }
+  if (!cfg || !cfg.carteiras || !cfg.carteiras.length) { console.log("rodada: nada para vigiar (0 carteiras)"); return; }
   const estado = JSON.parse((await env.CFG.get(ESTADO)) || "{}");
   const desde = Math.floor(Date.now() / 1000) - JANELA_S;
-  const resumo = { carteiras: cfg.carteiras.length, v2: 0, v1: 0, erros: 0, trades: 0, novos: 0, avisosOk: 0, avisosFalha: 0, topico: "..." + cfg.topico.slice(-4) };
+  const resumo = { carteiras: cfg.carteiras.length, v2: 0, v1: 0, erros: 0, trades: 0, novos: 0, avisosOk: 0, avisosFalha: 0 };
   // consulta todas as carteiras ao mesmo tempo (a espera de rede não conta como CPU)
   const respostas = await Promise.all(cfg.carteiras.map(c => buscar(c.w, desde)));
   const novas = [];
@@ -171,11 +204,11 @@ async function vigiar(env) {
     const titulo = `${nome}: ${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
     const corpo = `${t.title || t.slug || ""}\n${moeda(g.custo)}${g.n > 1 ? ` em ${g.n} execuções` : ""} · odd ${odd}`;
     const click = t.eventSlug ? "https://polymarket.com/event/" + t.eventSlug : "";
-    const ok = await avisar(cfg.topico, titulo, corpo, venda ? "red_circle" : "green_circle", click);
+    const ok = await avisar(env, titulo, corpo, venda ? "red_circle" : "green_circle", click);
     if (ok) resumo.avisosOk++; else resumo.avisosFalha++;
   }
   if (grupos.length > MAX_AVISOS) {
-    await avisar(cfg.topico, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez. Abra a página para ver todas.", "bell");
+    await avisar(env, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez. Abra a página para ver todas.", "bell");
   }
   // números importantes primeiro, para aparecerem na lista mesmo com o texto cortado
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
@@ -184,15 +217,30 @@ async function vigiar(env) {
 export default {
   async fetch(req, env) {
     if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (req.headers.get("Authorization") !== "Bearer " + env.CHAVE) return resp("nao autorizado", 401);
-    if (new URL(req.url).pathname !== "/config" || req.method !== "POST") return resp("ok");
+    if (!env.CHAVE || req.headers.get("Authorization") !== "Bearer " + env.CHAVE) return resp("nao autorizado", 401);
+    const caminho = new URL(req.url).pathname;
+    if (req.method !== "POST" || (caminho !== "/config" && caminho !== "/notify")) return resp("ok");
     let b;
     try { b = await req.json(); } catch (e) { return resp("json invalido", 400); }
+    if (!b || typeof b !== "object") return resp("json invalido", 400);
+
+    if (caminho === "/notify") {
+      // aviso avulso (botão de teste da página): título, texto, ícone e link opcionais, tudo validado
+      const titulo = String(b.titulo || "Aviso de teste").slice(0, 100);
+      const corpo = String(b.corpo || "Teste do servidor: se você recebeu esta mensagem, o Telegram está funcionando.").slice(0, 500);
+      const tag = Object.keys(EMOJI).includes(b.tag) ? b.tag : "bell";
+      const click = typeof b.click === "string" && /^https:\/\/[^\s]{1,280}$/.test(b.click) ? b.click : "";
+      const ok = await avisar(env, titulo, corpo, tag, click);
+      return resp(JSON.stringify({ ok }), ok ? 200 : 502);
+    }
+
     const carteiras = (Array.isArray(b.carteiras) ? b.carteiras : [])
       .filter(c => c && /^0x[0-9a-fA-F]{40}$/.test(c.w || ""))
       .slice(0, 20)
       .map(c => ({ w: c.w.toLowerCase(), nome: String(c.nome || "").slice(0, 40) }));
-    const topico = String(b.topico || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    // "topico" (ntfy) não é mais usado; continua guardado só para o Worker antigo poder voltar, se for preciso
+    const antigo = JSON.parse((await env.CFG.get("cfg")) || "null") || {};
+    const topico = String(b.topico || antigo.topico || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
     await env.CFG.put("cfg", JSON.stringify({ carteiras, topico }));
     // esquece o estado de carteiras que saíram da lista
     const estado = JSON.parse((await env.CFG.get(ESTADO)) || "{}");
@@ -200,17 +248,17 @@ export default {
     let limpou = false;
     for (const w of Object.keys(estado)) if (!manter.has(w)) { delete estado[w]; limpou = true; }
     if (limpou) await env.CFG.put(ESTADO, JSON.stringify(estado));
-    // confirmação de ponta a ponta: este aviso prova que o servidor consegue falar com o ntfy
-    if (topico && carteiras.length) await avisar(topico, "Servidor sincronizado", "Vigiando " + carteiras.length + " carteira(s) a cada minuto, mesmo com a página fechada.", "white_check_mark");
-    return resp(JSON.stringify({ carteiras: carteiras.length }));
+    // confirmação de ponta a ponta: este aviso prova que o servidor consegue falar com o Telegram
+    let aviso = null;
+    if (carteiras.length) aviso = await avisar(env, "Servidor sincronizado", "Vigiando " + carteiras.length + " carteira(s) a cada minuto, mesmo com a página fechada.", "white_check_mark");
+    return resp(JSON.stringify({ carteiras: carteiras.length, aviso }));
   },
   async scheduled(ev, env, ctx) {
     ctx.waitUntil(vigiar(env).catch(async e => {
       console.error("vigiar falhou: " + e);
       try {
         const min = new Date(ev.scheduledTime).getUTCMinutes();
-        const cfg = JSON.parse((await env.CFG.get("cfg")) || "null");
-        if (cfg && cfg.topico && min % 15 === 0) await avisar(cfg.topico, "Monitor com erro", String(e).slice(0, 200), "warning");
+        if (min % 15 === 0) await avisar(env, "Monitor com erro", String(e).slice(0, 200), "warning");
       } catch (e2) { console.error("aviso de erro falhou: " + e2); }
     }));
   },
