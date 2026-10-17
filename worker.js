@@ -151,7 +151,7 @@ function agrupar(novas) {
   }
   return [...grupos.values()].sort((x, y) => y.custo - x.custo);
 }
-const moeda = v => "US$ " + v.toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const MAX_AVISOS = 8; // por rodada; o que passar disso vira um aviso-resumo
 
 async function vigiar(env) {
@@ -201,14 +201,19 @@ async function vigiar(env) {
     const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nome = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
-    const titulo = `${nome}: ${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
-    const corpo = `${t.title || t.slug || ""}\n${moeda(g.custo)}${g.n > 1 ? ` em ${g.n} execuções` : ""} · odd ${odd}`;
-    const click = t.eventSlug ? "https://polymarket.com/event/" + t.eventSlug : "";
-    const ok = await avisar(env, titulo, corpo, venda ? "red_circle" : "green_circle", click);
+    // a odd vem primeiro (é o início da mensagem, que aparece na prévia da notificação); sem link
+    const titulo = `Odd ${odd}`;
+    const corpo = [
+      `Carteira: ${nome}`,
+      `Partida: ${t.title || t.slug || "?"}`,
+      `Aposta: ${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`,
+      `Entrada: ${moeda(g.custo)}${g.n > 1 ? ` (em ${g.n} execuções)` : ""}`,
+    ].join("\n");
+    const ok = await avisar(env, titulo, corpo, venda ? "red_circle" : "green_circle", "");
     if (ok) resumo.avisosOk++; else resumo.avisosFalha++;
   }
   if (grupos.length > MAX_AVISOS) {
-    await avisar(env, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez. Abra a página para ver todas.", "bell");
+    await avisar(env, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez: só as primeiras foram enviadas.", "bell");
   }
   // números importantes primeiro, para aparecerem na lista mesmo com o texto cortado
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
