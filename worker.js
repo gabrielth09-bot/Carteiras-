@@ -4,9 +4,10 @@
 // Usa a mesma consulta da página (Data API v2 primeiro, v1 como reserva).
 const DATA = "https://data-api.polymarket.com";
 const ESPORT = /^(lol|cs2?|csgo|dota2?|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|kog|hok|mlbb|sc2|starcraft)(?![a-z])/i;
-const JANELA_S = 900; // só os últimos 15 minutos (o plano grátis tem 10 ms de CPU por rodada)
+const JANELA_S = 900;    // só os últimos 15 minutos (o plano grátis tem 10 ms de CPU por rodada)
 const LIMITE = 200;      // apostas por página
 const MAX_PAGINAS = 3;   // carteiras com muitas execuções pequenas podem passar de uma página
+const MAX_AVISOS = 8;    // apostas avisadas por rodada; o que passar disso vira um aviso-resumo
 const vistosMem = {};    // memória desta instância: reserva caso o KV falhe
 const ESTADO = "estado2"; // nome novo: na primeira rodada as carteiras só são marcadas, sem aviso
 const CORS = {
@@ -86,9 +87,22 @@ async function buscar(w, desde) {
   return null;
 }
 
-const EMOJI = { red_circle: "🔴", green_circle: "🟢", white_check_mark: "✅", warning: "⚠️", bell: "🔔" };
 const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const pausa = ms => new Promise(r => setTimeout(r, ms));
+const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// hora de Brasília (UTC-3; o Brasil não usa horário de verão desde 2019)
+function horaBrasilia(ms) {
+  if (!ms) return "-";
+  const d = new Date(ms - 3 * 3600 * 1000);
+  return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+}
+// traço que fecha cada aviso: separa uma mensagem da outra no chat
+const SEP = "─".repeat(30);
+// "LoL: X vs Y - Game 3 Winner" vira partida "LoL: X vs Y" e mercado "Game 3 Winner"
+function partidaEMercado(titulo) {
+  const i = titulo.lastIndexOf(" - ");
+  return i > 0 ? { partida: titulo.slice(0, i), mercado: titulo.slice(i + 3).trim() } : { partida: titulo, mercado: "" };
+}
 
 // uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
 async function enviarTelegram(env, texto, html) {
@@ -107,15 +121,15 @@ async function enviarTelegram(env, texto, html) {
   };
 }
 
-async function avisar(env, titulo, corpo, tag, click) {
+// título em negrito, linhas simples e um traço no fim; sem emoji e sem link de prévia
+async function avisar(env, titulo, corpo, click) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("telegram: faltam TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID");
     return false;
   }
-  const emoji = EMOJI[tag] || EMOJI.bell;
   const link = click ? "\n" + click : "";
-  const textoHtml = `${emoji} <b>${esc(titulo)}</b>\n${esc(corpo)}${esc(link)}`;
-  const textoPlano = `${emoji} ${titulo}\n${corpo}${link}`;
+  const textoHtml = `<b>${esc(titulo)}</b>\n${esc(corpo)}\n${SEP}${esc(link)}`;
+  const textoPlano = `${titulo}\n${corpo}\n${SEP}${link}`;
   for (let tentativa = 0; tentativa < 2; tentativa++) {
     try {
       let r = await enviarTelegram(env, textoHtml, true);
@@ -140,19 +154,20 @@ async function avisar(env, titulo, corpo, tag, click) {
 }
 
 // junta as execuções fracionadas: uma aposta (carteira + mercado + lado) vira UM aviso com o total
+// e guarda a hora da primeira execução
 function agrupar(novas) {
   const grupos = new Map();
   for (const { c, t } of novas) {
     const k = [c.w, t.conditionId, t.outcome, String(t.side || "").toUpperCase()].join("|");
     let g = grupos.get(k);
-    if (!g) { g = { c, t, n: 0, cotas: 0, custo: 0 }; grupos.set(k, g); }
+    if (!g) { g = { c, t, cotas: 0, custo: 0, ms: 0 }; grupos.set(k, g); }
     const size = Number(t.size) || 0, preco = Number(t.price) || 0;
-    g.n++; g.cotas += size; g.custo += size * preco;
+    const ms = paraMs(t.timestamp);
+    g.cotas += size; g.custo += size * preco;
+    if (ms && (!g.ms || ms < g.ms)) g.ms = ms;
   }
   return [...grupos.values()].sort((x, y) => y.custo - x.custo);
 }
-const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const MAX_AVISOS = 8; // por rodada; o que passar disso vira um aviso-resumo
 
 async function vigiar(env) {
   const cfg = JSON.parse((await env.CFG.get("cfg")) || "null");
@@ -201,19 +216,23 @@ async function vigiar(env) {
     const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nome = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
-    // a odd vem primeiro (é o início da mensagem, que aparece na prévia da notificação); sem link
-    const titulo = `Odd ${odd}`;
+    const oque = `${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
+    const { partida, mercado } = partidaEMercado(t.title || t.slug || "?");
+    // a notificação mostra só as primeiras linhas (odd, entrada, mercado): por isso essa ordem
+    const titulo = venda ? `Odd ${odd} (saída) · ${oque}` : `Odd ${odd} · ${oque}`;
     const corpo = [
+      `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
+      mercado ? `Mercado: ${mercado}` : null,
       `Carteira: ${nome}`,
-      `Partida: ${t.title || t.slug || "?"}`,
-      `Aposta: ${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`,
-      `Entrada: ${moeda(g.custo)}${g.n > 1 ? ` (em ${g.n} execuções)` : ""}`,
-    ].join("\n");
-    const ok = await avisar(env, titulo, corpo, venda ? "red_circle" : "green_circle", "");
+      `Partida: ${partida}`,
+      `Hora: ${horaBrasilia(g.ms)}`,
+    ].filter(x => x !== null).join("\n");
+    const ok = await avisar(env, titulo, corpo, "");
     if (ok) resumo.avisosOk++; else resumo.avisosFalha++;
   }
   if (grupos.length > MAX_AVISOS) {
-    await avisar(env, `+${grupos.length - MAX_AVISOS} outras apostas`, "Muitas apostas de uma vez: só as primeiras foram enviadas.", "bell");
+    const sobra = grupos.length - MAX_AVISOS;
+    await avisar(env, `+${sobra} ${sobra === 1 ? "outra aposta" : "outras apostas"}`, `Só as ${MAX_AVISOS} primeiras foram enviadas.`, "");
   }
   // números importantes primeiro, para aparecerem na lista mesmo com o texto cortado
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
@@ -230,12 +249,11 @@ export default {
     if (!b || typeof b !== "object") return resp("json invalido", 400);
 
     if (caminho === "/notify") {
-      // aviso avulso (botão de teste da página): título, texto, ícone e link opcionais, tudo validado
+      // aviso avulso (botão de teste da página): título, texto e link opcional, tudo validado
       const titulo = String(b.titulo || "Aviso de teste").slice(0, 100);
       const corpo = String(b.corpo || "Teste do servidor: se você recebeu esta mensagem, o Telegram está funcionando.").slice(0, 500);
-      const tag = Object.keys(EMOJI).includes(b.tag) ? b.tag : "bell";
       const click = typeof b.click === "string" && /^https:\/\/[^\s]{1,280}$/.test(b.click) ? b.click : "";
-      const ok = await avisar(env, titulo, corpo, tag, click);
+      const ok = await avisar(env, titulo, corpo, click);
       return resp(JSON.stringify({ ok }), ok ? 200 : 502);
     }
 
@@ -255,7 +273,10 @@ export default {
     if (limpou) await env.CFG.put(ESTADO, JSON.stringify(estado));
     // confirmação de ponta a ponta: este aviso prova que o servidor consegue falar com o Telegram
     let aviso = null;
-    if (carteiras.length) aviso = await avisar(env, "Servidor sincronizado", "Vigiando " + carteiras.length + " carteira(s) a cada minuto, mesmo com a página fechada.", "white_check_mark");
+    if (carteiras.length) {
+      const n = carteiras.length;
+      aviso = await avisar(env, "Servidor sincronizado", `Vigiando ${n} ${n === 1 ? "carteira" : "carteiras"}.`, "");
+    }
     return resp(JSON.stringify({ carteiras: carteiras.length, aviso }));
   },
   async scheduled(ev, env, ctx) {
@@ -263,7 +284,7 @@ export default {
       console.error("vigiar falhou: " + e);
       try {
         const min = new Date(ev.scheduledTime).getUTCMinutes();
-        if (min % 15 === 0) await avisar(env, "Monitor com erro", String(e).slice(0, 200), "warning");
+        if (min % 15 === 0) await avisar(env, "Monitor com erro", String(e).slice(0, 200), "");
       } catch (e2) { console.error("aviso de erro falhou: " + e2); }
     }));
   },
