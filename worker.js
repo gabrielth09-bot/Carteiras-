@@ -206,13 +206,62 @@ function formatarLinhaMercado(mercado, outcome) {
   return `${nomeMercado} — ${timeEscolhido} (${sinal}${valor})`;
 }
 
+// Retorna um confronto somente quando existem dois lados explicitamente separados por vs/versus.
+// Isso impede que títulos de mercado como "Games Total: O/U 2.5" virem nome de tópico.
+function extrairConfronto(texto) {
+  const s = String(texto || "").replace(/\s+/g, " ").trim();
+  if (!s) return null;
+  const m = s.match(/^(.+?)\s+(?:vs\.?|versus)\s+(.+?)(?:\s+(?:[-–—|])\s+.*)?$/i);
+  if (!m) return null;
+  const limparLado = value => String(value || "")
+    .replace(/\s*\([^)]*\)/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s:|–—-]+|[\s:|–—-]+$/g, "")
+    .trim();
+  const esquerda = limparLado(m[1]);
+  const direita = limparLado(m[2]);
+  if (!esquerda || !direita || /^(?:o\/u|over|under|yes|no)$/i.test(esquerda)) return null;
+  return `${esquerda} vs ${direita}`.slice(0, 100);
+}
+
 function nomeDoJogo(partida) {
-  const i = partida.search(/\s+vs\s+/i);
-  if (i < 0) return partida;
-  const esq = partida.slice(0, i).replace(/^.*:\s*/, "");
-  const dir = partida.slice(i).replace(/^\s+vs\s+/i, "");
-  const limpa = s => s.replace(/\s*\([^)]*\)/g, "").trim();
-  return `${limpa(esq)} vs ${limpa(dir)}`;
+  return extrairConfronto(partida) || String(partida || "").trim();
+}
+
+// O campo title da Data API costuma ser o título do mercado, não o nome do evento.
+// Consultamos o slug do evento na Gamma API para recuperar o confronto verdadeiro.
+async function buscarNomeConfrontoEvento(eventSlug, orcamento) {
+  const slug = String(eventSlug || "").trim();
+  if (!slug || slug.length > 300) return null;
+  const url = `https://gamma-api.polymarket.com/events/slug/${encodeURIComponent(slug)}`;
+  const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "gamma");
+  if (!r.ok) return null;
+  let raw;
+  try { raw = await r.json(); } catch (_) { return null; }
+  const evento = Array.isArray(raw) ? raw[0] : raw;
+  if (!evento || typeof evento !== "object") return null;
+  const candidatos = [evento.title, evento.name, evento.subtitle, evento.ticker, evento.slug];
+  for (const candidato of candidatos) {
+    const confronto = extrairConfronto(candidato);
+    if (confronto) return confronto;
+  }
+  return null;
+}
+
+async function resolverNomeTopico(t, partida, orcamento, cache) {
+  const direto = extrairConfronto(partida) || extrairConfronto(t && t.title);
+  if (direto) return direto;
+  const eventSlug = String((t && t.eventSlug) || "").trim();
+  if (!eventSlug) return null;
+  if (cache.has(eventSlug)) return cache.get(eventSlug);
+  let nome = null;
+  try {
+    nome = await buscarNomeConfrontoEvento(eventSlug, orcamento);
+  } catch (e) {
+    console.warn("metadados do evento indisponiveis; nao sera criado topico com nome de mercado: " + String(e).slice(0, 120));
+  }
+  cache.set(eventSlug, nome);
+  return nome;
 }
 
 async function enviarTelegram(env, texto, html, topico, orcamento) {
@@ -273,6 +322,18 @@ async function criarTopico(env, nome, orcamento) {
     throw new Error(d && d.description ? String(d.description).slice(0, 160) : "HTTP " + r.status);
   }
   return d.result.message_thread_id;
+}
+async function renomearTopico(env, topico, nome, orcamento) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) throw new Error("faltam token ou chat");
+  const r = await fetchControlado(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/editForumTopic`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico, name: String(nome).slice(0, 100) }),
+  }, orcamento, "telegram");
+  let d = null;
+  try { d = await r.json(); } catch (_) {}
+  if (r.ok && d && d.ok === true) return true;
+  if (d && /not modified/i.test(String(d.description || ""))) return true;
+  throw new Error(d && d.description ? String(d.description).slice(0, 160) : "HTTP " + r.status);
 }
 async function lerTopicos(env) {
   const raw = await env.CFG.get(TOPICOS);
@@ -590,25 +651,56 @@ async function vigiar(env) {
   const topicos = lote.length ? await lerTopicos(env) : null;
   const topicByGroup = new Map();
   const groupsNeedingTopicCommit = new Set();
+  const nomesEventoResolvidos = new Map();
   let topicosMudou = false;
   if (topicos) {
     for (const g of lote) {
       const t = g.t;
-      const { partida } = separarTitulo(t.title || t.slug || "?");
+      const tituloMercado = t.title || t.slug || "?";
+      const { partida } = separarTitulo(tituloMercado);
       const keyTopic = String(t.eventSlug || partida);
-      let topicId = idTopico(topicos[keyTopic]);
+      const salvo = topicos[keyTopic];
+      const salvoNome = salvo && typeof salvo === "object" ? String(salvo.nome || "") : "";
+      let topicId = idTopico(salvo);
+
+      // Reaproveita nomes de confronto ja corretos; se o nome salvo e um mercado,
+      // resolve o nome real do evento e renomeia o topico existente sem mudar seu ID.
+      let nomeTopico = extrairConfronto(salvoNome);
+      if (!nomeTopico) {
+        nomeTopico = await resolverNomeTopico(t, partida, orcamento, nomesEventoResolvidos);
+      }
+
       if (!topicId) {
+        if (!nomeTopico) {
+          // Melhor enviar ao chat geral do que criar um novo topico chamado "Under/Over" ou nome de mercado.
+          console.warn("topico nao criado: confronto nao identificado com seguranca para " + String(t.eventSlug || partida).slice(0, 120));
+          topicByGroup.set(g, { id: null, keyTopic, nome: null });
+          continue;
+        }
         try {
-          topicId = await criarTopico(env, nomeDoJogo(partida), orcamento);
-          topicos[keyTopic] = { id: topicId, nome: nomeDoJogo(partida) };
+          topicId = await criarTopico(env, nomeTopico, orcamento);
+          topicos[keyTopic] = { id: topicId, nome: nomeTopico };
           topicosMudou = true;
           groupsNeedingTopicCommit.add(g);
         } catch (e) {
           console.error("criar topico falhou: " + limpar(env, e));
           topicId = null; // O aviso vai para a conversa geral; não bloqueia a fila.
         }
+      } else if (nomeTopico && nomeTopico !== salvoNome) {
+        try {
+          await renomearTopico(env, topicId, nomeTopico, orcamento);
+          topicos[keyTopic] = { id: topicId, nome: nomeTopico };
+          topicosMudou = true;
+          groupsNeedingTopicCommit.add(g);
+        } catch (e) {
+          console.error("renomear topico falhou; o alerta sera enviado ao topico existente: " + limpar(env, e));
+          nomeTopico = salvoNome || nomeTopico;
+        }
       }
-      topicByGroup.set(g, { id: topicId, keyTopic });
+      // Se a consulta de metadados falhar para um topico antigo, preserva o ID atual,
+      // mas nao usa seu nome errado para recriar um topico caso o Telegram o tenha apagado.
+      if (!nomeTopico && topicId && salvoNome) nomeTopico = salvoNome;
+      topicByGroup.set(g, { id: topicId, keyTopic, nome: nomeTopico });
     }
   }
   let topicosCommitOk = true;
@@ -631,13 +723,14 @@ async function vigiar(env) {
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nomeCarteira = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
     const { partida, mercado, campeonato } = separarTitulo(t.title || t.slug || "?");
+    const mercadoMensagem = mercado || (t.title && PARECE_MERCADO.test(t.title) && !extrairConfronto(t.title) ? t.title : null);
     // Sem título personalizado: tudo é texto simples para facilitar copiar a mensagem.
     // O nome da carteira e o valor ficam na primeira linha; o separador testado no Telegram fecha o alerta.
     const titulo = "";
     const linhas = [
       `${nomeCarteira} — ${moeda(g.custo)}`,
       "",
-      formatarLinhaMercado(mercado, t.outcome),
+      formatarLinhaMercado(mercadoMensagem, t.outcome),
       "",
       `Odd da compra: ${odd}`,
       `Horário da aposta: ${horaBrasilia(g.ms)}`,
@@ -645,13 +738,15 @@ async function vigiar(env) {
       "───────────────────",
     ].filter(x => x !== null);
     const corpo = linhas.join("\n");
-    const prepared = topicByGroup.get(g) || { id: null, keyTopic: String(t.eventSlug || partida) };
+    const prepared = topicByGroup.get(g) || { id: null, keyTopic: String(t.eventSlug || partida), nome: null };
     let topicId = prepared.id;
     let result = await avisar(env, titulo, corpo, "", topicId, orcamento);
     if (!result.ok && topicId && /thread/i.test(result.desc) && topicos) {
       try {
-        const replacement = await criarTopico(env, nomeDoJogo(partida), orcamento);
-        topicos[prepared.keyTopic] = { id: replacement, nome: nomeDoJogo(partida) };
+        const nomeSubstituto = extrairConfronto(prepared.nome);
+        if (!nomeSubstituto) throw new Error("confronto nao identificado; recusando criar topico com nome de mercado");
+        const replacement = await criarTopico(env, nomeSubstituto, orcamento);
+        topicos[prepared.keyTopic] = { id: replacement, nome: nomeSubstituto };
         // Tente persistir o tópico substituto antes de marcar a notificação como entregue.
         await env.CFG.put(TOPICOS, JSON.stringify(topicos));
         topicId = replacement;
