@@ -261,7 +261,8 @@ async function vigiar(env) {
     // a notificação mostra só as primeiras linhas (odd, entrada, mercado): por isso essa ordem
     const corpo = [
       `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
-      mercado ? `Mercado: ${mercado}` : null,
+      // título sem nome de mercado (só partida e campeonato): a aposta é no vencedor da partida
+      `Mercado: ${mercado || "Vencedor da partida"}`,
       `Carteira: ${nome}`,
       campeonato ? `Campeonato: ${campeonato}` : null,
       `Hora: ${horaBrasilia(g.ms)}`,
