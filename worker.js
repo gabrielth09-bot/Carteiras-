@@ -259,12 +259,11 @@ async function vigiar(env) {
     // a primeira linha (odd e o que foi feito) fica em negrito; os detalhes ficam na citação
     const titulo = `Odd ${odd} · ${oque}`;
     // a notificação mostra só as primeiras linhas (odd, entrada, mercado): por isso essa ordem
-    // dentro do tópico o nome da partida já aparece no título dele; na conversa geral a linha "Partida" fica
-    const montarCorpo = (comPartida) => [
+    const corpo = [
       `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
       mercado ? `Mercado: ${mercado}` : null,
       `Carteira: ${nome}`,
-      comPartida ? `Partida: ${partida}` : null,
+      `Partida: ${partida}`,
       campeonato ? `Campeonato: ${campeonato}` : null,
       `Hora: ${horaBrasilia(g.ms)}`,
     ].filter(x => x !== null).join("\n");
@@ -281,16 +280,11 @@ async function vigiar(env) {
       try { topico = await criar(); }
       catch (e) { console.error("criar tópico falhou: " + limpar(env, e)); topico = null; }
     }
-    let r = await avisar(env, titulo, montarCorpo(!topico), "", topico);
+    let r = await avisar(env, titulo, corpo, "", topico);
     // o tópico foi apagado no Telegram: cria outro e manda de novo
     if (!r.ok && topico && /thread/i.test(r.desc)) {
-      try { topico = await criar(); r = await avisar(env, titulo, montarCorpo(!topico), "", topico); }
-      catch (e) { console.error("recriar tópico falhou: " + limpar(env, e)); topico = null; r = await avisar(env, titulo, montarCorpo(true), "", null); }
-    }
-    // o tópico recusou o aviso por outro motivo (fechado, por exemplo): vai para a conversa geral, para o aviso não se perder
-    if (!r.ok && topico) {
-      topico = null;
-      r = await avisar(env, titulo, montarCorpo(true), "", null);
+      try { topico = await criar(); r = await avisar(env, titulo, corpo, "", topico); }
+      catch (e) { console.error("recriar tópico falhou: " + limpar(env, e)); r = await avisar(env, titulo, corpo, "", null); }
     }
     if (r.ok) resumo.avisosOk++; else resumo.avisosFalha++;
   }
