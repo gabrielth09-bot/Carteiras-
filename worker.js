@@ -127,6 +127,16 @@ function separarTitulo(titulo) {
   return { partida, mercado, campeonato: resto.length ? resto.join(" - ") : null };
 }
 
+// nome do tópico: "Time A vs Time B", sem o nome do jogo, o handicap nem o formato (BO3)
+function nomeDoJogo(partida) {
+  const i = partida.search(/\s+vs\s+/i);
+  if (i < 0) return partida;
+  const esq = partida.slice(0, i).replace(/^.*:\s*/, ""); // tira "Counter-Strike:" ou "Map Handicap:"
+  const dir = partida.slice(i).replace(/^\s+vs\s+/i, "");
+  const limpa = s => s.replace(/\s*\([^)]*\)/g, "").trim(); // tira "(-1.5)", "(+1.5)" e "(BO3)"
+  return `${limpa(esq)} vs ${limpa(dir)}`;
+}
+
 // uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
 // Com topico, a mensagem vai para dentro dele; sem topico, vai para a conversa geral do grupo.
 async function enviarTelegram(env, texto, html, topico) {
@@ -282,8 +292,9 @@ async function vigiar(env) {
     // a partida tem um tópico só dela: é criado na primeira aposta e reaproveitado depois
     const chaveP = String(t.eventSlug || partida);
     const criar = async () => {
-      const id = await criarTopico(env, partida);
-      topicos[chaveP] = { id, nome: partida };
+      const nome = nomeDoJogo(partida);
+      const id = await criarTopico(env, nome);
+      topicos[chaveP] = { id, nome };
       topicosMudou = true;
       return id;
     };
