@@ -90,18 +90,25 @@ async function buscar(w, desde) {
 const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const pausa = ms => new Promise(r => setTimeout(r, ms));
 const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-// hora de Brasília (UTC-3; o Brasil não usa horário de verão desde 2019)
+// hora de Brasília (UTC-3; o Brasil não usa horário de verão desde 2019), com segundos
 function horaBrasilia(ms) {
   if (!ms) return "-";
   const d = new Date(ms - 3 * 3600 * 1000);
-  return String(d.getUTCHours()).padStart(2, "0") + ":" + String(d.getUTCMinutes()).padStart(2, "0");
+  const p = n => String(n).padStart(2, "0");
+  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
-// traço que fecha cada aviso: separa uma mensagem da outra no chat
-const SEP = "─".repeat(30);
-// "LoL: X vs Y - Game 3 Winner" vira partida "LoL: X vs Y" e mercado "Game 3 Winner"
-function partidaEMercado(titulo) {
-  const i = titulo.lastIndexOf(" - ");
-  return i > 0 ? { partida: titulo.slice(0, i), mercado: titulo.slice(i + 3).trim() } : { partida: titulo, mercado: "" };
+// O título vem como "Partida - Mercado", "Partida - Mercado - Campeonato" ou "Partida - Campeonato"
+// (quando o mercado é só quem vence a partida, não há trecho de mercado). Só vira mercado o trecho que parece mercado.
+const PARECE_MERCADO = /\b(winner|moneyline|handicap|spread|total|kills?|first blood|over|under)\b|\b(map|mapa|game|jogo|round|set)\s*\d+\b/i;
+function separarTitulo(titulo) {
+  const partes = String(titulo).split(" - ").map(p => p.trim());
+  let mercado = null;
+  const resto = [];
+  for (const p of partes.slice(1)) {
+    if (mercado === null && PARECE_MERCADO.test(p)) mercado = p;
+    else resto.push(p);
+  }
+  return { partida: partes[0], mercado, campeonato: resto.length ? resto.join(" - ") : null };
 }
 
 // uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
@@ -121,15 +128,15 @@ async function enviarTelegram(env, texto, html) {
   };
 }
 
-// título em negrito, linhas simples e um traço no fim; sem emoji e sem link de prévia
+// título em negrito e detalhes numa citação (barra lateral); sem emoji e sem link de prévia
 async function avisar(env, titulo, corpo, click) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("telegram: faltam TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID");
     return false;
   }
   const link = click ? "\n" + click : "";
-  const textoHtml = `<b>${esc(titulo)}</b>\n${esc(corpo)}\n${SEP}${esc(link)}`;
-  const textoPlano = `${titulo}\n${corpo}\n${SEP}${link}`;
+  const textoHtml = `<b>${esc(titulo)}</b>\n<blockquote>${esc(corpo)}</blockquote>${esc(link)}`;
+  const textoPlano = `${titulo}\n${corpo}${link}`;
   for (let tentativa = 0; tentativa < 2; tentativa++) {
     try {
       let r = await enviarTelegram(env, textoHtml, true);
@@ -151,6 +158,28 @@ async function avisar(env, titulo, corpo, click) {
     }
   }
   return false;
+}
+
+// teste do recurso de tópicos: cria um tópico na conversa com o bot e manda uma mensagem dentro dele
+async function testarTopico(env) {
+  const base = "https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/";
+  const chamar = async (metodo, corpo) => {
+    const r = await fetch(base + metodo, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo) });
+    const d = await r.json().catch(() => null);
+    if (!d || d.ok !== true) throw new Error((d && d.description) || "HTTP " + r.status);
+    return d.result;
+  };
+  try {
+    const topico = await chamar("createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: "Teste de tópico" });
+    await chamar("sendMessage", {
+      chat_id: env.TELEGRAM_CHAT_ID,
+      message_thread_id: topico.message_thread_id,
+      text: "Se você recebeu esta notificação dentro do tópico, o recurso funciona.",
+    });
+    return "ok";
+  } catch (e) {
+    return String(e.message || e).split(env.TELEGRAM_BOT_TOKEN).join("***");
+  }
 }
 
 // junta as execuções fracionadas: uma aposta (carteira + mercado + lado) vira UM aviso com o total
@@ -217,14 +246,16 @@ async function vigiar(env) {
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nome = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
     const oque = `${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
-    const { partida, mercado } = partidaEMercado(t.title || t.slug || "?");
+    const { partida, mercado, campeonato } = separarTitulo(t.title || t.slug || "?");
+    // a primeira linha (odd e o que foi feito) fica em negrito; os detalhes ficam na citação
+    const titulo = `Odd ${odd} · ${oque}`;
     // a notificação mostra só as primeiras linhas (odd, entrada, mercado): por isso essa ordem
-    const titulo = venda ? `Odd ${odd} (saída) · ${oque}` : `Odd ${odd} · ${oque}`;
     const corpo = [
       `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
       mercado ? `Mercado: ${mercado}` : null,
       `Carteira: ${nome}`,
       `Partida: ${partida}`,
+      campeonato ? `Campeonato: ${campeonato}` : null,
       `Hora: ${horaBrasilia(g.ms)}`,
     ].filter(x => x !== null).join("\n");
     const ok = await avisar(env, titulo, corpo, "");
@@ -276,6 +307,12 @@ export default {
     if (carteiras.length) {
       const n = carteiras.length;
       aviso = await avisar(env, "Servidor sincronizado", `Vigiando ${n} ${n === 1 ? "carteira" : "carteiras"}.`, "");
+    }
+    // teste único do recurso de tópicos: roda nas sincronizações até funcionar (depois de ligar o modo de tópicos no BotFather)
+    if (env.TELEGRAM_BOT_TOKEN && !(await env.CFG.get("teste_topico"))) {
+      const res = await testarTopico(env);
+      if (res === "ok") await env.CFG.put("teste_topico", "ok");
+      await avisar(env, "Teste de tópico", res === "ok" ? "Funcionou. O tópico 'Teste de tópico' pode ser apagado quando quiser." : "Não funcionou: " + res, "");
     }
     return resp(JSON.stringify({ carteiras: carteiras.length, aviso }));
   },
