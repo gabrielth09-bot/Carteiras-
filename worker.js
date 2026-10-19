@@ -1,51 +1,77 @@
-// Worker Polymarket -> Telegram (versao com fila persistente e limites controlados)
-// Mantem as configuracoes existentes: CFG, CHAVE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-// Cron * * * * *, endpoints /config e /notify.
-//
-// Comportamento importante:
-// - A primeira consulta de cada carteira apenas estabelece a linha de base, sem alertas antigos.
-// - O excedente de alertas NAO e descartado: fica em fila no KV e sera enviado nas rodadas seguintes.
-// - O estado e atualizado somente quando ha mudancas relevantes, nao uma vez por aposta.
-// - O uso de fetch externo e limitado por rodada para respeitar o plano Workers Free.
-// - Em caso de queda entre enviar uma mensagem e salvar o estado, pode haver duplicata (at-least-once),
-//   preferivel a perder silenciosamente uma notificacao.
+// Worker Polymarket -> Telegram
+// Compatibilidade: KV CFG, secret CHAVE, TELEGRAM_BOT_TOKEN, variável TELEGRAM_CHAT_ID,
+// Cron * * * * *, endpoints POST /config e POST /notify, payload { carteiras: [{w, nome}] }.
+// Estado persistente na chave estado3; migra de estado2 e preserva topicos.
+// Entrega at-least-once: uma falha de KV depois do envio pode causar duplicata, nunca uma confirmação falsa.
 
 const DATA = "https://data-api.polymarket.com";
-const ESPORT = /^(lol|cs2?|csgo|dota2?|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|kog|hok|mlbb|sc2|starcraft)(?![a-z])/i;
-const JANELA_S = 900; // mantem a janela original de 15 minutos e evita avisos antigos apos a migracao
-const LIMITE_V2 = 1000; // limite maximo documentado para Data API v2
-const LIMITE_V1 = 200;  // reserva conservadora para a API antiga
-const MAX_PAGINAS = 3;
+const ESPORT = /(?:^|[-_])(lol|league-of-legends|cs2?|csgo|counter-strike|dota2?|dota-2|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|rocket-league|kog|hok|mlbb|sc2|starcraft)(?:[-_]|$)/i;
+
+// Plano Workers Free: no máximo 50 subrequests externas por invocação.
+// Deixamos folga para retentativas do Telegram e criação de tópicos.
+const LIMITE_V2 = 100; // limite deliberadamente menor que o máximo da API para limitar CPU/memória
+const LIMITE_V1 = 100;
+const MAX_PAGINAS_POR_CARTEIRA_RODADA = 3;
 const MAX_CARTEIRAS = 20;
-const MAX_AVISOS_POR_RODADA = 8; // e um lote maximo, NAO um limite que descarte o restante
-const MAX_DATA_CALLS = 30; // 20 consultas iniciais + ate 10 paginacoes/reservas por rodada
-const MAX_TOTAL_FETCHES = 48; // reserva chamadas para Telegram e criacao de topicos
-const ESTADO = "estado3"; // novo estado: seen + fila pendente no mesmo objeto
+const MAX_AVISOS_POR_RODADA = 8; // lote de envio; excedente continua na fila
+const MAX_DATA_CALLS = 24;
+const MAX_TOTAL_FETCHES = 48;
+const MAX_CONCURRENT_FETCHES = 4; // abaixo do limite de seis conexões simultâneas do Workers
+const MAX_PENDING = 3000; // ao alcançar, pausa novas consultas e drena a fila sem descartar itens
+const MAX_SEEN_PER_WALLET = 1500;
+const OVERLAP_SECONDS = 120;
+const API_INGESTION_LAG_SECONDS = 20;
+const CHECKPOINT_INTERVAL_SECONDS = 1800;
+const ESTADO = "estado3";
 const ESTADO_LEGADO = "estado2";
 const TOPICOS = "topicos";
+
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers": "Authorization, Content-Type",
+  "Access-Control-Max-Age": "86400",
 };
-const resp = (t, s = 200) => new Response(t, { status: s, headers: CORS });
+const jsonResp = (data, status = 200) => new Response(JSON.stringify(data), {
+  status,
+  headers: { ...CORS, "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+});
+const textResp = (text, status = 200) => new Response(text, {
+  status, headers: { ...CORS, "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },
+});
 
 function novoOrcamento() { return { total: 0, data: 0 }; }
-class OrcamentoEsgotado extends Error { constructor(msg = "orcamento de requisicoes da rodada esgotado") { super(msg); this.name = "OrcamentoEsgotado"; } }
+class OrcamentoEsgotado extends Error {
+  constructor(msg = "orcamento de requisicoes da rodada esgotado") { super(msg); this.name = "OrcamentoEsgotado"; }
+}
 async function fetchControlado(url, init, orcamento, tipo = "outro") {
   if (orcamento.total >= MAX_TOTAL_FETCHES) throw new OrcamentoEsgotado();
-  if (tipo === "data" && orcamento.data >= MAX_DATA_CALLS) throw new OrcamentoEsgotado("orcamento de consultas a Polymarket esgotado");
+  if (tipo === "data" && orcamento.data >= MAX_DATA_CALLS) {
+    throw new OrcamentoEsgotado("orcamento de consultas a Polymarket esgotado");
+  }
   orcamento.total++;
   if (tipo === "data") orcamento.data++;
   return fetch(url, init);
 }
 
+async function mapLimit(items, limit, fn) {
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+}
+
 function paraMs(ts) {
   if (ts === null || ts === undefined || ts === "") return 0;
   const n = Number(ts);
-  if (n) return n > 1e12 ? n : n * 1000;
-  const d = Date.parse(String(ts).trim().replace(" ", "T").replace(/([+-]\d{2})$/, "$1:00"));
-  return isNaN(d) ? 0 : d;
+  if (Number.isFinite(n) && n !== 0) return n > 1e12 ? n : n * 1000;
+  const parsed = Date.parse(String(ts).trim().replace(" ", "T").replace(/([+-]\d{2})$/, "$1:00"));
+  return Number.isNaN(parsed) ? 0 : parsed;
 }
 function normalizar(t) {
   if (!t || typeof t !== "object") return null;
@@ -53,7 +79,7 @@ function normalizar(t) {
     conditionId: t.conditionId || t.condition_id || "",
     eventSlug: t.eventSlug || t.event_slug || "",
     slug: t.slug || "",
-    title: t.title || "",
+    title: t.title || t.market || "",
     outcome: t.outcome || t.outcome_name || "?",
     side: t.side || "",
     size: t.size,
@@ -62,6 +88,7 @@ function normalizar(t) {
     transactionHash: t.transactionHash || t.transaction_hash || t.txHash || t.tx_hash || "",
   };
 }
+// Mantém a chave compatível com estado3 produzido pela versão anterior, para não duplicar a fila antiga.
 function chave(t) {
   return [t.transactionHash || "", t.conditionId, Math.floor(paraMs(t.timestamp) / 1000),
     Number(t.size).toFixed(4), Number(t.price).toFixed(4), t.outcome].join("|");
@@ -73,83 +100,59 @@ function cursorDe(body) {
   return p.next_cursor || p.nextCursor || body.next_cursor || body.nextCursor || null;
 }
 function listaDe(body) {
-  return Array.isArray(body) ? body : (body && (body.data || body.events) || []);
+  if (Array.isArray(body)) return body; // compatibilidade com a API v1
+  if (body && Array.isArray(body.data)) return body.data;
+  if (body && Array.isArray(body.events)) return body.events;
+  throw new Error("resposta inesperada da Data API: lista de trades ausente");
 }
-function soEsports(lista) {
-  const saida = [];
-  for (const t of lista) {
-    if (!t || typeof t !== "object") continue;
-    const slug = t.eventSlug || t.event_slug || t.slug || "";
-    if (ESPORT.test(slug)) {
-      const n = normalizar(t);
-      if (n) saida.push(n);
-    }
+function eEsports(t) {
+  // Não deixa um eventSlug não relacionado esconder um slug de mercado que identifica e-sports.
+  const slugs = [t.eventSlug, t.event_slug, t.slug, t.marketSlug, t.market_slug]
+    .filter(x => typeof x === "string" && x.trim());
+  return slugs.some(s => ESPORT.test(s));
+}
+function soEsports(rows) {
+  const out = [];
+  for (const t of rows) {
+    if (!t || typeof t !== "object" || !eEsports(t)) continue;
+    const n = normalizar(t);
+    if (n) out.push(n);
   }
-  return saida;
+  return out;
 }
-function montarUrlTrades(w, desde, cursor = null, v2 = true) {
-  const path = v2 ? "/v2/trades" : "/trades";
-  const u = new URL(DATA + path);
+function montarUrlTrades(w, start, end, cursor = null, api = "v2", offset = 0) {
+  const v2 = api === "v2";
+  const u = new URL(DATA + (v2 ? "/v2/trades" : "/trades"));
   u.searchParams.set("user", w);
   u.searchParams.set("limit", String(v2 ? LIMITE_V2 : LIMITE_V1));
-  u.searchParams.set("start", String(desde));
-  if (cursor) u.searchParams.set("cursor", String(cursor));
+  u.searchParams.set("start", String(start));
+  u.searchParams.set("end", String(end));
+  if (v2 && cursor) u.searchParams.set("cursor", String(cursor));
+  // O endpoint legado usa offset. O cursor v2 não deve ser misturado a offset.
+  if (!v2 && offset > 0) u.searchParams.set("offset", String(offset));
   return u.toString();
-}
-async function buscarPrimeira(c, desde, orcamento) {
-  try {
-    const r = await fetchControlado(montarUrlTrades(c.w, desde, null, true), undefined, orcamento, "data");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const b = await r.json();
-    const lista = listaDe(b);
-    return {
-      api: "v2", total: lista.length, esports: soEsports(lista), cursor: cursorDe(b), pages: 1,
-      incompleto: lista.length >= LIMITE_V2 && !cursorDe(b), erro: "",
-    };
-  } catch (e) {
-    if (e instanceof OrcamentoEsgotado) return { api: null, total: 0, esports: [], cursor: null, pages: 0, erro: String(e), reservaPendente: true };
-    return { api: null, total: 0, esports: [], cursor: null, pages: 0, erro: String(e) };
-  }
-}
-async function buscarReserva(c, desde, orcamento) {
-  try {
-    const r = await fetchControlado(montarUrlTrades(c.w, desde, null, false), undefined, orcamento, "data");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const b = await r.json();
-    const lista = listaDe(b);
-    return { api: "v1", total: lista.length, esports: soEsports(lista), cursor: null, pages: 1,
-      incompleto: lista.length >= LIMITE_V1, erro: "" };
-  } catch (e) {
-    return { api: null, total: 0, esports: [], cursor: null, pages: 0, erro: String(e) };
-  }
-}
-async function buscarProximaPagina(c, atual, desde, orcamento) {
-  try {
-    const r = await fetchControlado(montarUrlTrades(c.w, desde, atual.cursor, true), undefined, orcamento, "data");
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    const b = await r.json();
-    const lista = listaDe(b);
-    atual.total += lista.length;
-    atual.esports.push(...soEsports(lista));
-    atual.pages++;
-    atual.cursor = cursorDe(b);
-    if (!atual.cursor && lista.length >= LIMITE_V2) atual.incompleto = true;
-    return true;
-  } catch (e) {
-    atual.erroPagina = String(e);
-    return false;
-  }
 }
 
 const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const pausa = ms => new Promise(r => setTimeout(r, ms));
-const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const limpar = (env, e) => { const tok = env.TELEGRAM_BOT_TOKEN; return tok ? String(e).split(tok).join("***") : String(e); };
+const pausa = ms => new Promise(resolve => setTimeout(resolve, ms));
+const moeda = v => "US$ " + Number(v || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const limpar = (env, e) => {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const secret = env.CHAVE;
+  let s = String(e);
+  if (token) s = s.split(token).join("***");
+  if (secret) s = s.split(secret).join("***");
+  return s;
+};
 function horaBrasilia(ms) {
   if (!ms) return "-";
-  const d = new Date(ms - 3 * 3600 * 1000);
-  const p = n => String(n).padStart(2, "0");
-  return `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+  try {
+    return new Intl.DateTimeFormat("pt-BR", {
+      timeZone: "America/Sao_Paulo", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toISOString().slice(11, 19);
+  }
 }
 const PARECE_MERCADO = /\b(winner|moneyline|handicap|spread|total|kills?|first blood|over|under)\b|\b(map|mapa|game|jogo|round|set)\s*\d+\b/i;
 const ROTULO_MERCADO = /^(map handicap|handicap|map \d+ handicap|total maps|total kills|map \d+ winner|first blood)\s*:/i;
@@ -182,21 +185,26 @@ function nomeDoJogo(partida) {
 }
 
 async function enviarTelegram(env, texto, html, topico, orcamento) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return { ok: false, status: 0, desc: "faltam token ou chat", espera: 0 };
-  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, link_preview_options: { is_disabled: true } };
-  if (html) corpo.parse_mode = "HTML";
-  if (topico) corpo.message_thread_id = topico;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    return { ok: false, status: 0, desc: "faltam token ou chat", espera: 0 };
+  }
+  const body = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, link_preview_options: { is_disabled: true } };
+  if (html) body.parse_mode = "HTML";
+  if (topico) body.message_thread_id = topico;
   try {
-    const r = await fetchControlado("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo),
+    const r = await fetchControlado(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     }, orcamento, "telegram");
     let d = null;
     try { d = await r.json(); } catch (_) {}
-    return { ok: r.ok && !!d && d.ok === true, status: r.status,
-      desc: d && d.description ? String(d.description).slice(0, 120) : "",
-      espera: d && d.parameters && d.parameters.retry_after ? Number(d.parameters.retry_after) : 0 };
+    return {
+      ok: r.ok && !!d && d.ok === true,
+      status: r.status,
+      desc: d && d.description ? String(d.description).slice(0, 160) : "",
+      espera: Number((d && d.parameters && d.parameters.retry_after) || r.headers.get("Retry-After") || 0),
+    };
   } catch (e) {
-    return { ok: false, status: 0, desc: String(e), espera: 0 };
+    return { ok: false, status: 0, desc: limpar(env, e), espera: 0 };
   }
 }
 async function avisar(env, titulo, corpo, click, topico, orcamento) {
@@ -205,41 +213,54 @@ async function avisar(env, titulo, corpo, click, topico, orcamento) {
     return { ok: false, desc: "faltam o token ou o chat" };
   }
   const link = click ? "\n" + click : "";
-  const textoHtml = `<b>${esc(titulo)}</b>\n<blockquote>${esc(corpo)}</blockquote>${esc(link)}`;
-  const textoPlano = `${titulo}\n${corpo}${link}`;
-  let desc = "";
+  const htmlText = titulo ? `<b>${esc(titulo)}</b>\n<blockquote>${esc(corpo)}</blockquote>${esc(link)}` : `${esc(corpo)}${esc(link)}`;
+  const plainText = titulo ? `${titulo}\n${corpo}${link}` : `${corpo}${link}`;
   for (let tentativa = 0; tentativa < 2; tentativa++) {
-    let r = await enviarTelegram(env, textoHtml, true, topico, orcamento);
-    if (!r.ok && r.status === 400 && !/thread/i.test(r.desc)) {
-      r = await enviarTelegram(env, textoPlano, false, topico, orcamento);
+    let r = await enviarTelegram(env, htmlText, true, topico, orcamento);
+    if (!r.ok && r.status === 400 && /parse entities|can't parse|cant parse|unsupported start tag|unsupported end tag/i.test(r.desc)) {
+      r = await enviarTelegram(env, plainText, false, topico, orcamento);
     }
     if (r.ok) return { ok: true, desc: "" };
-    desc = r.desc;
-    if (r.status === 429 || r.status >= 500 || r.status === 0) {
-      if (tentativa === 0 && orcamento.total < MAX_TOTAL_FETCHES) {
-        await pausa(Math.min(Math.max(r.espera || 1, 1), 5) * 1000);
-        continue;
-      }
+    if (r.status !== 429 && r.status < 500 && r.status !== 0) return { ok: false, desc: r.desc };
+    if (tentativa === 0 && orcamento.total < MAX_TOTAL_FETCHES) {
+      await pausa(Math.min(Math.max(Number(r.espera) || 1, 1), 5) * 1000);
+      continue;
     }
-    return { ok: false, desc };
+    return { ok: false, desc: r.desc };
   }
-  return { ok: false, desc };
+  return { ok: false, desc: "falha de entrega ao Telegram" };
 }
 async function criarTopico(env, nome, orcamento) {
-  const r = await fetchControlado("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/createForumTopic", {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) throw new Error("faltam token ou chat");
+  const r = await fetchControlado(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/createForumTopic`, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, name: String(nome).slice(0, 100) }),
   }, orcamento, "telegram");
   let d = null;
   try { d = await r.json(); } catch (_) {}
-  if (!d || d.ok !== true || !d.result) throw new Error(d && d.description ? String(d.description).slice(0, 120) : "HTTP " + r.status);
+  if (!r.ok || !d || d.ok !== true || !d.result) {
+    throw new Error(d && d.description ? String(d.description).slice(0, 160) : "HTTP " + r.status);
+  }
   return d.result.message_thread_id;
 }
 async function lerTopicos(env) {
-  try { return JSON.parse((await env.CFG.get(TOPICOS)) || "{}") || {}; }
-  catch (e) { console.error("KV topicos: leitura falhou: " + limpar(env, e)); return null; }
+  const raw = await env.CFG.get(TOPICOS);
+  if (!raw) return {};
+  try {
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("formato invalido");
+    return value;
+  } catch (e) {
+    console.error("KV topicos: leitura falhou; avisos serao enviados ao topico geral: " + limpar(env, e));
+    return null;
+  }
 }
 
+function idTopico(valor) {
+  if (valor && typeof valor === "object") return valor.id || null;
+  const n = Number(valor);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
 function agruparPendentes(pendentes) {
   const grupos = new Map();
   for (const item of pendentes) {
@@ -251,241 +272,510 @@ function agruparPendentes(pendentes) {
       grupos.set(k, g);
     }
     const size = Number(t.size) || 0;
-    const preco = Number(t.price) || 0;
+    const price = Number(t.price) || 0;
     const ms = paraMs(t.timestamp);
     g.cotas += size;
-    g.custo += size * preco;
+    g.custo += size * price;
     g.ids.push(item.id);
-    if (ms && (!g.ms || ms < g.ms)) { g.ms = ms; if (!g.t.title && t.title) g.t = t; }
+    if (ms && (!g.ms || ms < g.ms)) g.ms = ms;
+    if (!g.t.title && t.title) g.t = t;
   }
-  return [...grupos.values()].sort((x, y) => y.custo - x.custo);
+  // Prioriza os grupos mais antigos para não deixar um mercado de baixo volume eternamente na fila.
+  return [...grupos.values()].sort((a, b) => (a.ms || 0) - (b.ms || 0));
 }
 
+function normalizarChaves(valor) {
+  if (Array.isArray(valor)) return [...new Set(valor.filter(x => typeof x === "string"))];
+  // Algumas versões antigas guardavam um mapa chave -> true em vez de uma lista.
+  if (valor && typeof valor === "object") return Object.keys(valor).filter(k => valor[k]);
+  return [];
+}
 async function carregarEstado(env) {
   const raw = await env.CFG.get(ESTADO);
   if (raw) {
-    const s = JSON.parse(raw);
+    let s;
+    try { s = JSON.parse(raw); } catch (_) { throw new Error("JSON invalido em " + ESTADO + "; estado mantido para evitar perder alertas"); }
     if (!s || typeof s !== "object" || !s.seen || typeof s.seen !== "object" || !Array.isArray(s.pending)) {
-      throw new Error("formato invalido em " + ESTADO + "; estado nao foi reinicializado para evitar perder alertas");
+      throw new Error("formato invalido em " + ESTADO + "; estado mantido para evitar perder alertas");
     }
-    return { version: 3, seen: s.seen, pending: s.pending };
+    const pendingMap = new Map();
+    for (const p of s.pending) {
+      if (!p || typeof p.id !== "string" || !p.c || typeof p.c.w !== "string" || !p.t || typeof p.t !== "object") {
+        throw new Error("item invalido na fila pendente; estado mantido para evitar perder alertas");
+      }
+      if (!pendingMap.has(p.id)) pendingMap.set(p.id, p);
+    }
+    const seen = {};
+    for (const [w, keys] of Object.entries(s.seen)) seen[w] = normalizarChaves(keys);
+    const sync = s.sync && typeof s.sync === "object" ? s.sync : {};
+    // A presença de um ciclo no KV significa que o cursor foi persistido em uma execução anterior.
+    for (const p of Object.values(sync)) if (p && p.cycle && typeof p.cycle === "object") p.cycle.persisted = true;
+    return {
+      version: 4,
+      seen,
+      pending: [...pendingMap.values()],
+      sync,
+      checkpointAt: Number(s.checkpointAt) || Math.floor(Date.now() / 1000),
+    };
   }
-  // Migra a lista vista pelo Worker antigo. Mantem as carteiras marcadas e inicia a fila vazia.
-  const legado = JSON.parse((await env.CFG.get(ESTADO_LEGADO)) || "{}");
-  return { version: 3, seen: legado && typeof legado === "object" ? legado : {}, pending: [] };
+  const legacyRaw = await env.CFG.get(ESTADO_LEGADO);
+  let legacy = {};
+  if (legacyRaw) {
+    try {
+      const parsed = JSON.parse(legacyRaw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) legacy = parsed;
+      else console.error("estado2 tem formato desconhecido; a chave antiga foi preservada");
+    } catch (e) { console.error("estado2 nao pode ser migrado: " + limpar(env, e)); }
+  }
+  const seen = {};
+  for (const [w, keys] of Object.entries(legacy)) seen[w] = normalizarChaves(keys);
+  return { version: 4, seen, pending: [], sync: {}, checkpointAt: Math.floor(Date.now() / 1000) };
+}
+function progressoInicial(since) { return { watermark: since - 1, cycle: null }; }
+function iniciarCiclo(progresso, since, agora) {
+  const start = Math.max(since, (Number(progresso.watermark) || (since - 1)) - OVERLAP_SECONDS);
+  const end = agora - API_INGESTION_LAG_SECONDS;
+  if (end < start) return false;
+  progresso.cycle = { start, end, api: "v2", cursor: null, offset: 0, pages: 0, persisted: false };
+  return true;
+}
+function temMaisDaResposta(api, body, rows) {
+  if (api === "v2") return cursorDe(body);
+  // Endpoint legado: se a pagina veio cheia, tenta a pagina seguinte por offset.
+  return rows.length >= LIMITE_V1 ? `v1:${rows.length}` : null;
+}
+function chavePendentePresente(state, id) { return state.pending.some(p => p.id === id); }
+
+async function pedirPaginaV2(w, cycle, orcamento) {
+  const url = montarUrlTrades(w, cycle.start, cycle.end, cycle.cursor, "v2", 0);
+  const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "data");
+  if (!r.ok) {
+    let message = "HTTP " + r.status;
+    try { const body = await r.json(); if (body && body.error) message = String(body.error).slice(0, 160); } catch (_) {}
+    const e = new Error(message); e.status = r.status; throw e;
+  }
+  const body = await r.json();
+  const rows = listaDe(body);
+  if (rows.length >= LIMITE_V2 && !cursorDe(body)) {
+    throw new Error("pagina v2 cheia sem cursor; ciclo nao confirmado para evitar pular trades");
+  }
+  return { body, rows, api: "v2" };
+}
+async function pedirPaginaV1(w, cycle, orcamento) {
+  const offset = Number(String(cycle.cursor || "v1:0").split(":")[1]) || 0;
+  const url = montarUrlTrades(w, cycle.start, cycle.end, null, "v1", offset);
+  const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "data");
+  if (!r.ok) {
+    let message = "HTTP " + r.status;
+    try { const body = await r.json(); if (body && body.error) message = String(body.error).slice(0, 160); } catch (_) {}
+    const e = new Error(message); e.status = r.status; throw e;
+  }
+  const body = await r.json();
+  return { body, rows: listaDe(body), api: "v1", offset };
+}
+
+async function buscarProcessarPagina(c, state, pendingIds, orcamento, flags) {
+  const w = c.w;
+  const progress = state.sync[w];
+  const cycle = progress.cycle;
+  if (!cycle) return { ok: false, more: false, attempted: false };
+  let page;
+  try {
+    if (cycle.api === "v1") {
+      page = await pedirPaginaV1(w, cycle, orcamento);
+    } else {
+      try {
+        page = await pedirPaginaV2(w, cycle, orcamento);
+      } catch (e) {
+        // Falhas transitórias/restrição de recursos não devem provocar consulta de reserva em duplicidade.
+        const terminalV2 = e && [400, 404, 405].includes(Number(e.status));
+        if (cycle.pages > 0 || !terminalV2) throw e;
+        console.error(`v2 recusou a consulta da carteira ${w.slice(0, 6)}...; tentando v1: ${limpar(flags.env, e)}`);
+        page = await pedirPaginaV1(w, { ...cycle, cursor: "v1:0" }, orcamento);
+      }
+    }
+  } catch (e) {
+    flags.erros++;
+    console.error(`consulta de trades falhou para ${w.slice(0, 6)}...: ${limpar(flags.env, e)}`);
+    return { ok: false, more: false, attempted: true };
+  }
+
+  const rows = soEsports(page.rows);
+  const seenArray = Array.isArray(state.seen[w]) ? state.seen[w] : [];
+  const seen = new Set(seenArray);
+  let seenChanged = false;
+  const cycleStartMs = cycle.start * 1000;
+  const cycleEndMs = cycle.end * 1000 + 999;
+  const sinceMs = Number(c.since) * 1000;
+
+  for (const t of rows) {
+    const ms = paraMs(t.timestamp);
+    // Sem timestamp não é possível respeitar a regra de não alertar operações anteriores à ativação.
+    if (!ms || ms < sinceMs || ms < cycleStartMs || ms > cycleEndMs) continue;
+    const k = chave(t);
+    if (!seen.has(k)) { seen.add(k); seenChanged = true; }
+    const id = idPendente(w, t);
+    if (pendingIds.has(id)) continue;
+    if (state.seen[w] && state.seen[w].includes(k)) continue;
+    state.pending.push({ id, c: { w, nome: String(c.nome || "").slice(0, 40) }, t });
+    pendingIds.add(id);
+    flags.novos++;
+    flags.dirty = true;
+  }
+  if (seenChanged) {
+    state.seen[w] = [...seen].slice(-MAX_SEEN_PER_WALLET);
+    flags.dirty = true;
+  }
+
+  flags.trades += page.rows.length;
+  if (page.api === "v2") flags.pagesV2++; else flags.pagesV1++;
+  const more = temMaisDaResposta(page.api, page.body, page.rows);
+  cycle.api = page.api;
+  cycle.pages = (Number(cycle.pages) || 0) + 1;
+  if (page.api === "v2") {
+    cycle.cursor = more ? String(more) : null;
+    cycle.offset = 0;
+  } else {
+    const offset = Number(page.offset || 0);
+    cycle.offset = offset;
+    cycle.cursor = more ? `v1:${offset + page.rows.length}` : null;
+  }
+  if (cycle.cursor) {
+    cycle.persisted = true;
+    flags.dirty = true; // Cursor persistente para continuar paginação na próxima execução.
+    return { ok: true, more: true, attempted: true };
+  }
+
+  const cycleHadBeenPersisted = cycle.persisted === true;
+  progress.watermark = cycle.end;
+  progress.cycle = null;
+  if (cycleHadBeenPersisted) flags.dirty = true; // Remove ciclo persistido e confirma o checkpoint concluído.
+  flags.completados++;
+  return { ok: true, more: false, attempted: true };
 }
 
 async function vigiar(env) {
   const orcamento = novoOrcamento();
-  const cfg = JSON.parse((await env.CFG.get("cfg")) || "null");
-  if (!cfg || !Array.isArray(cfg.carteiras) || !cfg.carteiras.length) {
-    console.log("rodada: nada para vigiar (0 carteiras)");
-    return;
-  }
-  const carteiras = cfg.carteiras.slice(0, MAX_CARTEIRAS);
-  const estado = await carregarEstado(env);
-  const desde = Math.floor(Date.now() / 1000) - JANELA_S;
-  const resumo = { carteiras: carteiras.length, v2: 0, v1: 0, erros: 0, trades: 0, novos: 0, avisosOk: 0, avisosFalha: 0, pendentes: estado.pending.length, paginacaoIncompleta: 0 };
+  const rawCfg = await env.CFG.get("cfg");
+  let cfg;
+  try { cfg = rawCfg ? JSON.parse(rawCfg) : null; }
+  catch (_) { throw new Error("JSON invalido na configuracao cfg; nenhuma carteira foi alterada"); }
+  if (cfg && (!Array.isArray(cfg.carteiras))) throw new Error("formato invalido em cfg.carteiras");
+  const nowMs = Date.now();
+  const nowSec = Math.floor(nowMs / 1000);
+  let carteiras = cfg && Array.isArray(cfg.carteiras) ? cfg.carteiras.slice(0, MAX_CARTEIRAS) : [];
+  let cfgDirty = false;
+  carteiras = carteiras.filter(c => c && /^0x[0-9a-fA-F]{40}$/.test(c.w || "")).map(c => {
+    let since = Number(c.since);
+    if (!Number.isFinite(since) || since <= 0) { since = Math.ceil(nowMs / 1000); cfgDirty = true; }
+    return { w: c.w.toLowerCase(), nome: String(c.nome || "").slice(0, 40), since };
+  });
+  if (cfgDirty) await env.CFG.put("cfg", JSON.stringify({ ...(cfg || {}), carteiras }));
 
-  // Primeira pagina para todas as carteiras primeiro; as chamadas extra sao distribuidas
-  // de forma rotativa para que carteiras no fim da lista nao fiquem sempre sem reserva/paginacao.
-  const respostas = await Promise.all(carteiras.map(c => buscarPrimeira(c, desde, orcamento)));
-  const inicio = carteiras.length ? Math.floor(Date.now() / 60000) % carteiras.length : 0;
-  const ordem = carteiras.map((_, i) => (i + inicio) % carteiras.length);
-  for (const i of ordem) {
-    const c = carteiras[i];
-    if (respostas[i].api) continue;
-    const reserva = await buscarReserva(c, desde, orcamento);
-    if (reserva.api) respostas[i] = reserva;
+  const state = await carregarEstado(env);
+  const flags = { env, dirty: false, novos: 0, erros: 0, completados: 0, trades: 0, pagesV2: 0, pagesV1: 0 };
+  const existingSync = state.sync && typeof state.sync === "object" ? state.sync : {};
+  state.sync = existingSync;
+  const activeWallets = new Set(carteiras.map(c => c.w));
+  const queuedWallets = new Set(state.pending.map(p => p.c.w.toLowerCase()));
+  // Limpeza de estado antigo dentro da gravação periódica, não no POST /config,
+  // para evitar que uma gravação concorrente da configuração sobrescreva estado recém-atualizado.
+  for (const w of Object.keys(state.seen)) {
+    if (!activeWallets.has(w.toLowerCase()) && !queuedWallets.has(w.toLowerCase())) {
+      delete state.seen[w]; flags.dirty = true;
+    }
   }
-  // No maximo uma pagina extra por carteira em cada passada; repete em ordem rotativa ate
-  // esgotar o orcamento ou os cursores, respeitando MAX_PAGINAS por carteira.
-  let houveProgresso = true;
-  while (houveProgresso && orcamento.data < MAX_DATA_CALLS) {
-    houveProgresso = false;
-    for (const i of ordem) {
-      const r = respostas[i];
-      if (!r || r.api !== "v2" || !r.cursor || r.pages >= MAX_PAGINAS || orcamento.data >= MAX_DATA_CALLS) continue;
-      const ok = await buscarProximaPagina(carteiras[i], r, desde, orcamento);
-      houveProgresso = houveProgresso || ok;
+  for (const w of Object.keys(state.sync)) {
+    if (!activeWallets.has(w.toLowerCase()) && !queuedWallets.has(w.toLowerCase())) {
+      delete state.sync[w]; flags.dirty = true;
+    }
+  }
+  for (const c of carteiras) {
+    if (!state.sync[c.w] || typeof state.sync[c.w] !== "object") {
+      state.sync[c.w] = progressoInicial(c.since);
+      flags.dirty = true;
+    } else {
+      const p = state.sync[c.w];
+      if (!Number.isFinite(Number(p.watermark))) { p.watermark = c.since - 1; flags.dirty = true; }
+      if (!Object.prototype.hasOwnProperty.call(p, "cycle")) p.cycle = null;
     }
   }
 
-  const pendingIds = new Set(estado.pending.map(p => p.id));
-  let mudouEstado = false;
-  for (let i = 0; i < carteiras.length; i++) {
-    const c = carteiras[i];
-    const r = respostas[i];
-    if (!r || !r.api) { resumo.erros++; continue; }
-    resumo[r.api]++;
-    resumo.trades += r.total;
-    if (r.incompleto || (r.api === "v2" && r.cursor)) resumo.paginacaoIncompleta++;
-    const esports = r.esports || [];
-    const primeira = !Object.prototype.hasOwnProperty.call(estado.seen, c.w);
-    const chavesAgora = esports.map(chave);
-    if (primeira) {
-      // A linha de base nao dispara alertas antigos na primeira consulta da carteira.
-      estado.seen[c.w] = chavesAgora;
-      mudouEstado = true;
-      continue;
+  const resumo = {
+    carteiras: carteiras.length, v2: 0, v1: 0, erros: 0, trades: 0, novos: 0,
+    avisosOk: 0, avisosFalha: 0, pendentes: state.pending.length, paginasIncompletas: 0,
+    fetchData: 0, fetchTotal: 0, backlogPausado: false,
+  };
+  const pendingIds = new Set(state.pending.map(p => p.id));
+
+  // Backlog alto: não avança cursores nem consulta mais operações; primeiro drena a fila.
+  if (state.pending.length < MAX_PENDING && carteiras.length) {
+    // Um ciclo novo é preparado em memória; ciclos com cursor são persistidos quando necessário.
+    for (const c of carteiras) {
+      const p = state.sync[c.w];
+      if (!p.cycle) iniciarCiclo(p, c.since, nowSec);
     }
-    const vistos = new Set(Array.isArray(estado.seen[c.w]) ? estado.seen[c.w] : []);
-    const novosNestaResposta = new Set();
-    for (const t of esports) {
-      const k = chave(t);
-      const id = idPendente(c.w, t);
-      if (vistos.has(k) || pendingIds.has(id) || novosNestaResposta.has(id)) continue;
-      novosNestaResposta.add(id);
-      estado.pending.push({ id, c: { w: c.w, nome: String(c.nome || "").slice(0, 40) }, t });
-      pendingIds.add(id);
-      resumo.novos++;
-      mudouEstado = true;
+    const ordemInicial = carteiras.map((_, i) => i);
+    const rotacao = carteiras.length ? Math.floor(nowSec / 60) % carteiras.length : 0;
+    const ordem = [...ordemInicial.slice(rotacao), ...ordemInicial.slice(0, rotacao)];
+    const chamadasRodada = new Map(carteiras.map(c => [c.w, 0]));
+    const bloqueadas = new Set();
+
+    await mapLimit(ordem, MAX_CONCURRENT_FETCHES, async i => {
+      const c = carteiras[i];
+      const cycleBefore = state.sync[c.w].cycle;
+      if (!cycleBefore || cycleBefore.end < cycleBefore.start) return;
+      const r = await buscarProcessarPagina(c, state, pendingIds, orcamento, flags);
+      if (r.attempted) chamadasRodada.set(c.w, 1);
+      if (!r.ok) bloqueadas.add(c.w);
+      if (r.ok && r.more) resumo.paginasIncompletas++;
+    });
+
+    // Paginacao adicional justa: no maximo 8 chamadas extras de dados, em ordem rotativa.
+    while (orcamento.data < MAX_DATA_CALLS && orcamento.total < MAX_TOTAL_FETCHES) {
+      const candidatos = ordem.map(i => carteiras[i]).filter(c => {
+        const p = state.sync[c.w];
+        return p && p.cycle && p.cycle.cursor && (chamadasRodada.get(c.w) || 0) < MAX_PAGINAS_POR_CARTEIRA_RODADA && !bloqueadas.has(c.w);
+      });
+      if (!candidatos.length) break;
+      const batch = candidatos.slice(0, Math.min(MAX_CONCURRENT_FETCHES, MAX_DATA_CALLS - orcamento.data));
+      if (!batch.length) break;
+      await mapLimit(batch, MAX_CONCURRENT_FETCHES, async c => {
+        const r = await buscarProcessarPagina(c, state, pendingIds, orcamento, flags);
+        chamadasRodada.set(c.w, (chamadasRodada.get(c.w) || 0) + (r.attempted ? 1 : 0));
+        if (!r.ok) bloqueadas.add(c.w);
+        if (r.ok && r.more) resumo.paginasIncompletas++;
+      });
     }
-    if (novosNestaResposta.size) estado.seen[c.w] = chavesAgora;
+  } else if (state.pending.length >= MAX_PENDING) {
+    resumo.backlogPausado = true;
+    console.warn(`backlog com ${state.pending.length} itens; novas consultas pausadas para priorizar a fila`);
   }
 
-  const grupos = agruparPendentes(estado.pending);
-  const topicos = grupos.length ? await lerTopicos(env) : null;
+  // Prepara tópicos de todo o lote e persiste o mapa UMA vez antes dos envios.
+  // Se a gravação do mapa falhar, os alertas que dependem dos novos tópicos ficam na fila.
+  const grupos = agruparPendentes(state.pending);
+  const lote = grupos.slice(0, MAX_AVISOS_POR_RODADA);
+  const topicos = lote.length ? await lerTopicos(env) : null;
+  const topicByGroup = new Map();
+  const groupsNeedingTopicCommit = new Set();
   let topicosMudou = false;
+  if (topicos) {
+    for (const g of lote) {
+      const t = g.t;
+      const { partida } = separarTitulo(t.title || t.slug || "?");
+      const keyTopic = String(t.eventSlug || partida);
+      let topicId = idTopico(topicos[keyTopic]);
+      if (!topicId) {
+        try {
+          topicId = await criarTopico(env, nomeDoJogo(partida), orcamento);
+          topicos[keyTopic] = { id: topicId, nome: nomeDoJogo(partida) };
+          topicosMudou = true;
+          groupsNeedingTopicCommit.add(g);
+        } catch (e) {
+          console.error("criar topico falhou: " + limpar(env, e));
+          topicId = null; // O aviso vai para a conversa geral; não bloqueia a fila.
+        }
+      }
+      topicByGroup.set(g, { id: topicId, keyTopic });
+    }
+  }
+  let topicosCommitOk = true;
+  if (topicosMudou) {
+    try { await env.CFG.put(TOPICOS, JSON.stringify(topicos)); }
+    catch (e) {
+      topicosCommitOk = false;
+      console.error("KV topicos: gravacao falhou; alertas que precisem de um topico novo serao adiados: " + limpar(env, e));
+    }
+  }
+
+  // Envio é separado da descoberta; filas que falham continuam persistidas para a próxima rodada.
   const entregues = new Set();
-  for (const g of grupos.slice(0, MAX_AVISOS_POR_RODADA)) {
+  for (const g of lote) {
     if (orcamento.total >= MAX_TOTAL_FETCHES) break;
+    if (groupsNeedingTopicCommit.has(g) && !topicosCommitOk) continue;
     const t = g.t;
     const pm = g.cotas > 0 ? g.custo / g.cotas : 0;
     const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nomeCarteira = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
-    const oque = `${venda ? "vendeu" : "comprou"} ${t.outcome || "?"}`;
     const { partida, mercado, campeonato } = separarTitulo(t.title || t.slug || "?");
-    const titulo = `Odd ${odd} · ${oque}`;
-    const corpo = [
-      `${venda ? "Valor bruto da venda" : "Valor bruto da compra"}: ${moeda(g.custo)}`,
-      `Mercado: ${mercado || "Vencedor da partida"}`,
-      `Carteira: ${nomeCarteira}`,
-      campeonato ? `Campeonato: ${campeonato}` : null,
-      `Hora: ${horaBrasilia(g.ms)}`,
-    ].filter(x => x !== null).join("\n");
-    const chaveP = String(t.eventSlug || partida);
-    let topico = topicos && topicos[chaveP] ? topicos[chaveP].id : null;
-    if (topicos && !topico) {
+    // Sem título personalizado: tudo é texto simples para facilitar copiar a mensagem.
+    // O nome da carteira e o valor ficam na primeira linha; o separador testado no Telegram fecha o alerta.
+    const titulo = "";
+    const linhas = [
+      `${nomeCarteira} — ${moeda(g.custo)}`,
+      "",
+      `${mercado || "Vencedor da partida"} — ${t.outcome || "?"}`,
+      "",
+      `Odd da compra: ${odd}`,
+      `Horário da aposta: ${horaBrasilia(g.ms)}`,
+      campeonato || null,
+      "───────────────────",
+    ].filter(x => x !== null);
+    const corpo = linhas.join("\n");
+    const prepared = topicByGroup.get(g) || { id: null, keyTopic: String(t.eventSlug || partida) };
+    let topicId = prepared.id;
+    let result = await avisar(env, titulo, corpo, "", topicId, orcamento);
+    if (!result.ok && topicId && /thread/i.test(result.desc) && topicos) {
       try {
-        topico = await criarTopico(env, nomeDoJogo(partida), orcamento);
-        topicos[chaveP] = { id: topico, nome: nomeDoJogo(partida) };
-        topicosMudou = true;
+        const replacement = await criarTopico(env, nomeDoJogo(partida), orcamento);
+        topicos[prepared.keyTopic] = { id: replacement, nome: nomeDoJogo(partida) };
+        // Tente persistir o tópico substituto antes de marcar a notificação como entregue.
+        await env.CFG.put(TOPICOS, JSON.stringify(topicos));
+        topicId = replacement;
+        result = await avisar(env, titulo, corpo, "", topicId, orcamento);
       } catch (e) {
-        console.error("criar tópico falhou: " + limpar(env, e));
-        topico = null; // entrega na conversa geral em vez de bloquear a notificacao
+        console.error("recriar topico falhou: " + limpar(env, e));
+        result = await avisar(env, titulo, corpo, "", null, orcamento);
       }
     }
-    let r = await avisar(env, titulo, corpo, "", topico, orcamento);
-    if (!r.ok && topico && /thread/i.test(r.desc) && topicos) {
-      try {
-        topico = await criarTopico(env, nomeDoJogo(partida), orcamento);
-        topicos[chaveP] = { id: topico, nome: nomeDoJogo(partida) };
-        topicosMudou = true;
-        r = await avisar(env, titulo, corpo, "", topico, orcamento);
-      } catch (e) {
-        console.error("recriar tópico falhou: " + limpar(env, e));
-        r = await avisar(env, titulo, corpo, "", null, orcamento);
-      }
-    }
-    if (r.ok) {
+    if (result.ok) {
       resumo.avisosOk++;
       for (const id of g.ids) entregues.add(id);
     } else {
       resumo.avisosFalha++;
-      console.error("aviso pendente para proxima rodada: " + (r.desc || "sem descricao"));
+      console.error("aviso permanece na fila: " + limpar(env, result.desc || "sem descricao"));
     }
-  }
-
-  if (topicosMudou) {
-    try { await env.CFG.put(TOPICOS, JSON.stringify(topicos)); }
-    catch (e) { console.error("KV topicos: gravacao falhou: " + limpar(env, e)); }
   }
   if (entregues.size) {
-    estado.pending = estado.pending.filter(p => !entregues.has(p.id));
-    mudouEstado = true;
+    state.pending = state.pending.filter(p => !entregues.has(p.id));
+    flags.dirty = true;
   }
-  resumo.pendentes = estado.pending.length;
-  if (mudouEstado) {
-    try { await env.CFG.put(ESTADO, JSON.stringify(estado)); }
-    catch (e) {
-      // Se o estado nao puder ser salvo, o lote entregue pode reaparecer (duplicata), mas a fila
-      // antiga nao e apagada e nao se marca no log que a gravacao ocorreu.
-      console.error("KV estado: gravacao falhou; uma notificacao pode repetir na proxima rodada: " + limpar(env, e));
+
+  // Checkpoint em lote para evitar escrita KV a cada minuto sem novas operacoes.
+  const precisaCheckpoint = nowSec - (Number(state.checkpointAt) || nowSec) >= CHECKPOINT_INTERVAL_SECONDS;
+  if (precisaCheckpoint) flags.dirty = true;
+  if (flags.dirty) {
+    state.version = 4;
+    state.checkpointAt = nowSec;
+    resumo.fetchData = orcamento.data;
+    resumo.fetchTotal = orcamento.total;
+    resumo.novos = flags.novos;
+    resumo.pendentes = state.pending.length;
+    try {
+      await env.CFG.put(ESTADO, JSON.stringify(state));
+    } catch (e) {
+      // At-least-once: se o envio já foi aceito pelo Telegram, o próximo ciclo pode repetir a mensagem.
+      console.error("KV estado: gravacao falhou; fila antiga preservada onde o KV permitir: " + limpar(env, e));
     }
+  } else {
+    resumo.fetchData = orcamento.data;
+    resumo.fetchTotal = orcamento.total;
+    resumo.novos = flags.novos;
+    resumo.pendentes = state.pending.length;
   }
-  console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} dataFetches=${orcamento.data} totalFetches=${orcamento.total} | rodada ` + JSON.stringify(resumo));
-  // Falhas em algumas carteiras nao devem ficar invisiveis: alerta operacional no maximo
-  // a cada 15 minutos. A mensagem e secundaria; alertas de apostas e fila continuam prioritarios.
-  if (resumo.erros > 0 && new Date().getUTCMinutes() % 15 === 0 && orcamento.total < MAX_TOTAL_FETCHES) {
+  resumo.erros += flags.erros;
+  resumo.trades = flags.trades;
+  resumo.v2 = flags.pagesV2;
+  resumo.v1 = flags.pagesV1;
+  console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
+
+  // Alerta operacional limitado a uma vez por quarto de hora.
+  if (resumo.erros > 0 && Math.floor(nowSec / 60) % 15 === 0 && orcamento.total < MAX_TOTAL_FETCHES) {
     await avisar(env, "Falha parcial de monitoramento",
-      `${resumo.erros} de ${carteiras.length} carteiras nao puderam ser consultadas nesta rodada. Consulte os logs do Worker.`,
-      "", null, orcamento);
+      `${resumo.erros} consulta(s) falharam nesta rodada. Veja os logs do Worker; a fila pendente foi mantida.`, "", null, orcamento);
   }
 }
 
+function normalizarListaConfig(lista, antigoCfg, agora) {
+  const antiga = new Map((Array.isArray(antigoCfg && antigoCfg.carteiras) ? antigoCfg.carteiras : [])
+    .filter(c => c && /^0x[0-9a-fA-F]{40}$/.test(c.w || ""))
+    .map(c => [c.w.toLowerCase(), c]));
+  const vistos = new Set();
+  const result = [];
+  for (const c of lista) {
+    if (result.length >= MAX_CARTEIRAS) break;
+    if (!c || !/^0x[0-9a-fA-F]{40}$/.test(c.w || "")) continue;
+    const w = c.w.toLowerCase();
+    if (vistos.has(w)) continue;
+    vistos.add(w);
+    const old = antiga.get(w);
+    let since = Number(old && old.since);
+    if (!Number.isFinite(since) || since <= 0) since = Math.ceil(agora / 1000);
+    result.push({ w, nome: String(c.nome || "").slice(0, 40), since });
+  }
+  return result;
+}
+
+let scheduledRunning = false;
+
 export default {
   async fetch(req, env) {
-    if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
-    if (!env.CHAVE || req.headers.get("Authorization") !== "Bearer " + env.CHAVE) return resp("nao autorizado", 401);
-    const caminho = new URL(req.url).pathname;
-    if (req.method !== "POST" || (caminho !== "/config" && caminho !== "/notify")) return resp("ok");
-    let b;
-    try { b = await req.json(); } catch (_) { return resp("json invalido", 400); }
-    if (!b || typeof b !== "object") return resp("json invalido", 400);
+    if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (!env.CHAVE || req.headers.get("Authorization") !== `Bearer ${env.CHAVE}`) return textResp("nao autorizado", 401);
+    const pathname = new URL(req.url).pathname;
+    if (req.method !== "POST") return textResp("metodo nao permitido", 405);
+    if (pathname !== "/config" && pathname !== "/notify") return textResp("nao encontrado", 404);
+    let body;
+    try { body = await req.json(); } catch (_) { return jsonResp({ ok: false, error: "json invalido" }, 400); }
+    if (!body || typeof body !== "object" || Array.isArray(body)) return jsonResp({ ok: false, error: "json invalido" }, 400);
     const orcamento = novoOrcamento();
 
-    if (caminho === "/notify") {
-      const titulo = String(b.titulo || "Aviso de teste").slice(0, 100);
-      const corpo = String(b.corpo || "Teste do servidor: se você recebeu esta mensagem, o Telegram está funcionando.").slice(0, 500);
-      const click = typeof b.click === "string" && /^https:\/\/[^\s]{1,280}$/.test(b.click) ? b.click : "";
-      const r = await avisar(env, titulo, corpo, click, null, orcamento);
-      return resp(JSON.stringify({ ok: r.ok }), r.ok ? 200 : 502);
+    if (pathname === "/notify") {
+      const title = String(body.titulo || "Aviso de teste").slice(0, 100);
+      const text = String(body.corpo || "Teste do servidor: se você recebeu esta mensagem, o Telegram está funcionando.").slice(0, 500);
+      const click = typeof body.click === "string" && /^https:\/\/[^\s]{1,280}$/.test(body.click) ? body.click : "";
+      const result = await avisar(env, title, text, click, null, orcamento);
+      return jsonResp({ ok: result.ok }, result.ok ? 200 : 502);
     }
 
-    const carteiras = (Array.isArray(b.carteiras) ? b.carteiras : [])
-      .filter(c => c && /^0x[0-9a-fA-F]{40}$/.test(c.w || ""))
-      .slice(0, MAX_CARTEIRAS)
-      .map(c => ({ w: c.w.toLowerCase(), nome: String(c.nome || "").slice(0, 40) }));
-    const antigo = JSON.parse((await env.CFG.get("cfg")) || "null") || {};
-    const topico = String(b.topico || antigo.topico || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-    await env.CFG.put("cfg", JSON.stringify({ carteiras, topico }));
+    if (!Object.prototype.hasOwnProperty.call(body, "carteiras") || !Array.isArray(body.carteiras)) {
+      return jsonResp({ ok: false, error: "carteiras deve ser uma lista" }, 400);
+    }
+    if (body.carteiras.length > MAX_CARTEIRAS) {
+      return jsonResp({ ok: false, error: `maximo de ${MAX_CARTEIRAS} carteiras` }, 400);
+    }
+    if (body.carteiras.some(c => !c || typeof c.w !== "string" || !/^0x[0-9a-fA-F]{40}$/.test(c.w))) {
+      return jsonResp({ ok: false, error: "uma ou mais carteiras tem endereco invalido" }, 400);
+    }
+    let oldCfg = {};
+    const oldRaw = await env.CFG.get("cfg");
+    if (oldRaw) {
+      try { oldCfg = JSON.parse(oldRaw) || {}; }
+      catch (_) { return jsonResp({ ok: false, error: "configuracao existente invalida; nenhuma alteracao realizada" }, 409); }
+    }
+    const carteiras = normalizarListaConfig(body.carteiras, oldCfg, Date.now());
+    const topico = String(body.topico || oldCfg.topico || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+    try {
+      await env.CFG.put("cfg", JSON.stringify({ carteiras, topico }));
+    } catch (e) {
+      console.error("KV config: gravacao falhou: " + limpar(env, e));
+      return jsonResp({ ok: false, error: "nao foi possivel salvar a configuracao no KV" }, 503);
+    }
 
-    // Limpa carteiras removidas do estado antigo e novo, mas preserva alertas ja enfileirados.
-    const manter = new Set(carteiras.map(c => c.w));
-    try {
-      const legado = JSON.parse((await env.CFG.get(ESTADO_LEGADO)) || "{}");
-      let mudou = false;
-      for (const w of Object.keys(legado)) if (!manter.has(w)) { delete legado[w]; mudou = true; }
-      if (mudou) await env.CFG.put(ESTADO_LEGADO, JSON.stringify(legado));
-    } catch (e) { console.error("limpeza estado antigo falhou: " + limpar(env, e)); }
-    try {
-      const raw = await env.CFG.get(ESTADO);
-      if (raw) {
-        const estado = JSON.parse(raw);
-        let mudou = false;
-        for (const w of Object.keys(estado.seen || {})) if (!manter.has(w)) { delete estado.seen[w]; mudou = true; }
-        if (mudou) await env.CFG.put(ESTADO, JSON.stringify(estado));
-      }
-    } catch (e) { console.error("limpeza estado falhou: " + limpar(env, e)); }
+    // A limpeza do estado de carteiras removidas acontece dentro do Cron, junto da gravação de estado,
+    // para evitar duas rotinas escrevendo a mesma chave KV simultaneamente.
 
     let aviso = null;
     if (carteiras.length) {
-      aviso = (await avisar(env, "Servidor sincronizado", `Vigiando ${carteiras.length} ${carteiras.length === 1 ? "carteira" : "carteiras"}.`, "", null, orcamento)).ok;
+      aviso = (await avisar(env, "Servidor sincronizado",
+        `Vigiando ${carteiras.length} ${carteiras.length === 1 ? "carteira" : "carteiras"}.`, "", null, orcamento)).ok;
     }
-    return resp(JSON.stringify({ carteiras: carteiras.length, aviso }));
+    return jsonResp({ ok: true, carteiras: carteiras.length, aviso });
   },
-  async scheduled(ev, env, ctx) {
-    ctx.waitUntil(vigiar(env).catch(async e => {
-      console.error("vigiar falhou: " + limpar(env, e));
+  async scheduled(event, env, ctx) {
+    // Protege contra sobreposição no mesmo isolate; KV não oferece lock/compare-and-swap global.
+    if (scheduledRunning) {
+      console.warn("rodada ignorada: outra execucao ainda esta ativa neste isolate");
+      return;
+    }
+    scheduledRunning = true;
+    ctx.waitUntil((async () => {
       try {
-        const min = new Date(ev.scheduledTime).getUTCMinutes();
-        if (min % 15 === 0) {
-          const orcamento = novoOrcamento();
-          await avisar(env, "Monitor com erro", limpar(env, e).slice(0, 200), "", null, orcamento);
-        }
-      } catch (e2) { console.error("aviso de erro falhou: " + limpar(env, e2)); }
-    }));
+        await vigiar(env);
+      } catch (error) {
+        console.error("vigiar falhou: " + limpar(env, error));
+        try {
+          const minute = new Date(event.scheduledTime).getUTCMinutes();
+          if (minute % 15 === 0 && env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID) {
+            const budget = novoOrcamento();
+            await avisar(env, "Monitor com erro", limpar(env, error).slice(0, 200), "", null, budget);
+          }
+        } catch (secondary) { console.error("aviso de erro falhou: " + limpar(env, secondary)); }
+      } finally {
+        scheduledRunning = false;
+      }
+    })());
   },
 };
