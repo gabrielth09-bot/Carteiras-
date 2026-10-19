@@ -175,6 +175,37 @@ function separarTitulo(titulo) {
   }
   return { partida, mercado, campeonato: resto.length ? resto.join(" - ") : null };
 }
+// Formata a selecao real de um mercado de handicap.
+// Em títulos como "Map Handicap: ALL (-1.5)", o sinal se refere ao time ALL.
+// Se a carteira comprou o outcome oposto (ex.: PRIVATE), inverte-se o sinal.
+function formatarLinhaMercado(mercado, outcome) {
+  const m = String(mercado || "").trim();
+  const escolha = String(outcome || "?").trim();
+  const fallback = `${m || "Vencedor da partida"} — ${escolha}`;
+  const match = m.match(/^(Map\s+\d+\s+Handicap|Map\s+Handicap|Handicap)\s*:\s*(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/i);
+  if (!match) return fallback;
+
+  // Não reinterpretar mercados binários genéricos; só times/seleções nomeados.
+  if (!escolha || /^(yes|no|sim|não|true|false)$/i.test(escolha)) return fallback;
+  const timeDoTitulo = match[2].trim();
+  const linhaOriginal = Number(match[3].replace(",", "."));
+  if (!timeDoTitulo || !Number.isFinite(linhaOriginal)) return fallback;
+
+  const normalizarLado = value => String(value).trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+  const mesmoLado = normalizarLado(escolha) === normalizarLado(timeDoTitulo);
+  const linhaEscolhida = mesmoLado ? linhaOriginal : -linhaOriginal;
+  const sinal = linhaEscolhida > 0 ? "+" : linhaEscolhida < 0 ? "-" : "";
+  const valor = Math.abs(linhaEscolhida).toLocaleString("en-US", {
+    useGrouping: false,
+    maximumFractionDigits: 4,
+  });
+  const nomeMercado = match[1].replace(/\s+/g, " ").trim();
+  const timeEscolhido = mesmoLado ? timeDoTitulo : escolha;
+
+  // No handicap, time e linha já descrevem a seleção; não repetir o outcome no fim.
+  return `${nomeMercado} — ${timeEscolhido} (${sinal}${valor})`;
+}
+
 function nomeDoJogo(partida) {
   const i = partida.search(/\s+vs\s+/i);
   if (i < 0) return partida;
@@ -606,7 +637,7 @@ async function vigiar(env) {
     const linhas = [
       `${nomeCarteira} — ${moeda(g.custo)}`,
       "",
-      `${mercado || "Vencedor da partida"} — ${t.outcome || "?"}`,
+      formatarLinhaMercado(mercado, t.outcome),
       "",
       `Odd da compra: ${odd}`,
       `Horário da aposta: ${horaBrasilia(g.ms)}`,
