@@ -1,6 +1,7 @@
 // Worker: vigia as carteiras da Polymarket a cada 1 minuto e avisa pelo Telegram.
+// Cada partida ganha um tópico no grupo, e os avisos dela vão para esse tópico.
 // Precisa de: KV com binding "CFG", segredo "CHAVE", segredo "TELEGRAM_BOT_TOKEN",
-// variável "TELEGRAM_CHAT_ID" e Cron "* * * * *".
+// variável "TELEGRAM_CHAT_ID" (ID do grupo, começa com -100) e Cron "* * * * *".
 // Usa a mesma consulta da página (Data API v2 primeiro, v1 como reserva).
 const DATA = "https://data-api.polymarket.com";
 const ESPORT = /^(lol|cs2?|csgo|dota2?|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|kog|hok|mlbb|sc2|starcraft)(?![a-z])/i;
@@ -10,6 +11,7 @@ const MAX_PAGINAS = 3;   // carteiras com muitas execuções pequenas podem pass
 const MAX_AVISOS = 8;    // apostas avisadas por rodada; o que passar disso vira um aviso-resumo
 const vistosMem = {};    // memória desta instância: reserva caso o KV falhe
 const ESTADO = "estado2"; // nome novo: na primeira rodada as carteiras só são marcadas, sem aviso
+const TOPICOS = "topicos"; // partida -> tópico no grupo (guardado no KV)
 const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
@@ -90,6 +92,8 @@ async function buscar(w, desde) {
 const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const pausa = ms => new Promise(r => setTimeout(r, ms));
 const moeda = v => "US$ " + v.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// tira o token de qualquer texto de erro antes de gravar no registro
+const limpar = (env, e) => { const tok = env.TELEGRAM_BOT_TOKEN; return tok ? String(e).split(tok).join("***") : String(e); };
 // hora de Brasília (UTC-3; o Brasil não usa horário de verão desde 2019), com segundos
 function horaBrasilia(ms) {
   if (!ms) return "-";
@@ -112,9 +116,11 @@ function separarTitulo(titulo) {
 }
 
 // uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
-async function enviarTelegram(env, texto, html) {
+// Com topico, a mensagem vai para dentro dele; sem topico, vai para a conversa geral do grupo.
+async function enviarTelegram(env, texto, html, topico) {
   const corpo = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, link_preview_options: { is_disabled: true } };
   if (html) corpo.parse_mode = "HTML";
+  if (topico) corpo.message_thread_id = topico;
   const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/sendMessage", {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo),
   });
@@ -128,58 +134,58 @@ async function enviarTelegram(env, texto, html) {
   };
 }
 
-// título em negrito e detalhes numa citação (barra lateral); sem emoji e sem link de prévia
-async function avisar(env, titulo, corpo, click) {
+// título em negrito e detalhes numa citação (barra lateral); sem emoji e sem link de prévia.
+// Devolve { ok, desc }: desc traz o motivo quando o Telegram recusa.
+async function avisar(env, titulo, corpo, click, topico) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.error("telegram: faltam TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID");
-    return false;
+    return { ok: false, desc: "faltam o token ou o chat" };
   }
   const link = click ? "\n" + click : "";
   const textoHtml = `<b>${esc(titulo)}</b>\n<blockquote>${esc(corpo)}</blockquote>${esc(link)}`;
   const textoPlano = `${titulo}\n${corpo}${link}`;
+  let desc = "";
   for (let tentativa = 0; tentativa < 2; tentativa++) {
     try {
-      let r = await enviarTelegram(env, textoHtml, true);
-      // 400 = o Telegram não aceitou o formato: tenta de novo em texto simples
-      if (!r.ok && r.status === 400) r = await enviarTelegram(env, textoPlano, false);
-      if (r.ok) return true;
+      let r = await enviarTelegram(env, textoHtml, true, topico);
+      // 400 = o Telegram não aceitou o formato: tenta de novo em texto simples (erro de tópico não depende do formato)
+      if (!r.ok && r.status === 400 && !/thread/i.test(r.desc)) r = await enviarTelegram(env, textoPlano, false, topico);
+      if (r.ok) return { ok: true, desc: "" };
+      desc = r.desc;
       console.error("telegram respondeu " + r.status + (r.desc ? ": " + r.desc : ""));
       // 429 (muitas mensagens) e 5xx (falha do Telegram): uma segunda tentativa; outros erros não adiantam repetir
       if (tentativa === 0 && (r.status === 429 || r.status >= 500)) {
         await pausa(Math.min(Math.max(r.espera, 1), 5) * 1000);
         continue;
       }
-      return false;
+      return { ok: false, desc };
     } catch (e) {
-      // o texto do erro pode, em tese, trazer a URL: o token é removido antes de gravar
-      console.error("telegram falhou: " + String(e).split(env.TELEGRAM_BOT_TOKEN).join("***"));
+      console.error("telegram falhou: " + limpar(env, e));
       if (tentativa === 0) { await pausa(1000); continue; }
-      return false;
+      return { ok: false, desc: "" };
     }
   }
-  return false;
+  return { ok: false, desc };
 }
 
-// teste do recurso de tópicos: cria um tópico na conversa com o bot e manda uma mensagem dentro dele
-async function testarTopico(env) {
-  const base = "https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/";
-  const chamar = async (metodo, corpo) => {
-    const r = await fetch(base + metodo, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corpo) });
-    const d = await r.json().catch(() => null);
-    if (!d || d.ok !== true) throw new Error((d && d.description) || "HTTP " + r.status);
-    return d.result;
-  };
-  try {
-    const topico = await chamar("createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: "Teste de tópico" });
-    await chamar("sendMessage", {
-      chat_id: env.TELEGRAM_CHAT_ID,
-      message_thread_id: topico.message_thread_id,
-      text: "Se você recebeu esta notificação dentro do tópico, o recurso funciona.",
-    });
-    return "ok";
-  } catch (e) {
-    return String(e.message || e).split(env.TELEGRAM_BOT_TOKEN).join("***");
+// cria um tópico no grupo com o nome da partida e devolve o id dele
+async function criarTopico(env, nome) {
+  const r = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/createForumTopic", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, name: String(nome).slice(0, 100) }),
+  });
+  let d = null;
+  try { d = await r.json(); } catch (e) { /* resposta sem JSON */ }
+  if (!d || d.ok !== true || !d.result) {
+    throw new Error(d && d.description ? String(d.description).slice(0, 120) : "HTTP " + r.status);
   }
+  return d.result.message_thread_id;
+}
+
+// mapa partida -> tópico, guardado no KV. Se o KV não responder, devolve null e os avisos vão para a conversa geral.
+async function lerTopicos(env) {
+  try { return JSON.parse((await env.CFG.get(TOPICOS)) || "{}") || {}; }
+  catch (e) { console.error("KV topicos: leitura falhou: " + limpar(env, e)); return null; }
 }
 
 // junta as execuções fracionadas: uma aposta (carteira + mercado + lado) vira UM aviso com o total
@@ -239,6 +245,9 @@ async function vigiar(env) {
   }
   const grupos = agrupar(lista);
   resumo.grupos = grupos.length;
+  // cada partida tem o seu tópico: o mapa só é lido se houver aviso para mandar
+  const topicos = grupos.length ? await lerTopicos(env) : null;
+  let topicosMudou = false;
   for (const g of grupos.slice(0, MAX_AVISOS)) {
     const t = g.t;
     const pm = g.cotas > 0 ? g.custo / g.cotas : 0; // preço médio ponderado pelo tamanho
@@ -250,20 +259,48 @@ async function vigiar(env) {
     // a primeira linha (odd e o que foi feito) fica em negrito; os detalhes ficam na citação
     const titulo = `Odd ${odd} · ${oque}`;
     // a notificação mostra só as primeiras linhas (odd, entrada, mercado): por isso essa ordem
-    const corpo = [
+    // dentro do tópico o nome da partida já aparece no título dele; na conversa geral a linha "Partida" fica
+    const montarCorpo = (comPartida) => [
       `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
       mercado ? `Mercado: ${mercado}` : null,
       `Carteira: ${nome}`,
-      `Partida: ${partida}`,
+      comPartida ? `Partida: ${partida}` : null,
       campeonato ? `Campeonato: ${campeonato}` : null,
       `Hora: ${horaBrasilia(g.ms)}`,
     ].filter(x => x !== null).join("\n");
-    const ok = await avisar(env, titulo, corpo, "");
-    if (ok) resumo.avisosOk++; else resumo.avisosFalha++;
+    // a partida tem um tópico só dela: é criado na primeira aposta e reaproveitado depois
+    const chaveP = String(t.eventSlug || partida);
+    const criar = async () => {
+      const id = await criarTopico(env, partida);
+      topicos[chaveP] = { id, nome: partida };
+      topicosMudou = true;
+      return id;
+    };
+    let topico = topicos && topicos[chaveP] ? topicos[chaveP].id : null;
+    if (topicos && !topico) {
+      try { topico = await criar(); }
+      catch (e) { console.error("criar tópico falhou: " + limpar(env, e)); topico = null; }
+    }
+    let r = await avisar(env, titulo, montarCorpo(!topico), "", topico);
+    // o tópico foi apagado no Telegram: cria outro e manda de novo
+    if (!r.ok && topico && /thread/i.test(r.desc)) {
+      try { topico = await criar(); r = await avisar(env, titulo, montarCorpo(!topico), "", topico); }
+      catch (e) { console.error("recriar tópico falhou: " + limpar(env, e)); topico = null; r = await avisar(env, titulo, montarCorpo(true), "", null); }
+    }
+    // o tópico recusou o aviso por outro motivo (fechado, por exemplo): vai para a conversa geral, para o aviso não se perder
+    if (!r.ok && topico) {
+      topico = null;
+      r = await avisar(env, titulo, montarCorpo(true), "", null);
+    }
+    if (r.ok) resumo.avisosOk++; else resumo.avisosFalha++;
+  }
+  if (topicosMudou) {
+    try { await env.CFG.put(TOPICOS, JSON.stringify(topicos)); }
+    catch (e) { console.error("KV topicos: gravar falhou: " + limpar(env, e)); }
   }
   if (grupos.length > MAX_AVISOS) {
     const sobra = grupos.length - MAX_AVISOS;
-    await avisar(env, `+${sobra} ${sobra === 1 ? "outra aposta" : "outras apostas"}`, `Só as ${MAX_AVISOS} primeiras foram enviadas.`, "");
+    await avisar(env, `+${sobra} ${sobra === 1 ? "outra aposta" : "outras apostas"}`, `Só as ${MAX_AVISOS} primeiras foram enviadas.`, "", null);
   }
   // números importantes primeiro, para aparecerem na lista mesmo com o texto cortado
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
@@ -284,8 +321,8 @@ export default {
       const titulo = String(b.titulo || "Aviso de teste").slice(0, 100);
       const corpo = String(b.corpo || "Teste do servidor: se você recebeu esta mensagem, o Telegram está funcionando.").slice(0, 500);
       const click = typeof b.click === "string" && /^https:\/\/[^\s]{1,280}$/.test(b.click) ? b.click : "";
-      const ok = await avisar(env, titulo, corpo, click);
-      return resp(JSON.stringify({ ok }), ok ? 200 : 502);
+      const r = await avisar(env, titulo, corpo, click, null);
+      return resp(JSON.stringify({ ok: r.ok }), r.ok ? 200 : 502);
     }
 
     const carteiras = (Array.isArray(b.carteiras) ? b.carteiras : [])
@@ -306,23 +343,17 @@ export default {
     let aviso = null;
     if (carteiras.length) {
       const n = carteiras.length;
-      aviso = await avisar(env, "Servidor sincronizado", `Vigiando ${n} ${n === 1 ? "carteira" : "carteiras"}.`, "");
-    }
-    // teste único do recurso de tópicos: roda nas sincronizações até funcionar (depois de ligar o modo de tópicos no BotFather)
-    if (env.TELEGRAM_BOT_TOKEN && !(await env.CFG.get("teste_topico"))) {
-      const res = await testarTopico(env);
-      if (res === "ok") await env.CFG.put("teste_topico", "ok");
-      await avisar(env, "Teste de tópico", res === "ok" ? "Funcionou. O tópico 'Teste de tópico' pode ser apagado quando quiser." : "Não funcionou: " + res, "");
+      aviso = (await avisar(env, "Servidor sincronizado", `Vigiando ${n} ${n === 1 ? "carteira" : "carteiras"}.`, "", null)).ok;
     }
     return resp(JSON.stringify({ carteiras: carteiras.length, aviso }));
   },
   async scheduled(ev, env, ctx) {
     ctx.waitUntil(vigiar(env).catch(async e => {
-      console.error("vigiar falhou: " + e);
+      console.error("vigiar falhou: " + limpar(env, e));
       try {
         const min = new Date(ev.scheduledTime).getUTCMinutes();
-        if (min % 15 === 0) await avisar(env, "Monitor com erro", String(e).slice(0, 200), "");
-      } catch (e2) { console.error("aviso de erro falhou: " + e2); }
+        if (min % 15 === 0) await avisar(env, "Monitor com erro", limpar(env, e).slice(0, 200), "", null);
+      } catch (e2) { console.error("aviso de erro falhou: " + limpar(env, e2)); }
     }));
   },
 };
