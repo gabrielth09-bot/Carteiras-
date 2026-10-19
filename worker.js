@@ -263,7 +263,6 @@ async function vigiar(env) {
       `${venda ? "Recebido" : "Entrada"}: ${moeda(g.custo)}`,
       mercado ? `Mercado: ${mercado}` : null,
       `Carteira: ${nome}`,
-      `Partida: ${partida}`,
       campeonato ? `Campeonato: ${campeonato}` : null,
       `Hora: ${horaBrasilia(g.ms)}`,
     ].filter(x => x !== null).join("\n");
