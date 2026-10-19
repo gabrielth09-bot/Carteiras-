@@ -104,15 +104,27 @@ function horaBrasilia(ms) {
 // O título vem como "Partida - Mercado", "Partida - Mercado - Campeonato" ou "Partida - Campeonato"
 // (quando o mercado é só quem vence a partida, não há trecho de mercado). Só vira mercado o trecho que parece mercado.
 const PARECE_MERCADO = /\b(winner|moneyline|handicap|spread|total|kills?|first blood|over|under)\b|\b(map|mapa|game|jogo|round|set)\s*\d+\b/i;
+// alguns mercados trazem o nome do mercado no começo do título: "Map Handicap: BCA (-1.5) vs Spirit Academy (BO3)"
+const ROTULO_MERCADO = /^(map handicap|handicap|map \d+ handicap|total maps|total kills|map \d+ winner|first blood)\s*:/i;
 function separarTitulo(titulo) {
   const partes = String(titulo).split(" - ").map(p => p.trim());
+  let partida = partes[0];
   let mercado = null;
+  const rotulo = partida.match(/^([^:]+):\s*(.+)$/);
+  if (rotulo && ROTULO_MERCADO.test(partida)) {
+    // mercado: "Map Handicap: BCA (-1.5)"; partida: "BCA vs Spirit Academy (BO3)" (sem a linha do handicap)
+    const corpo = rotulo[2];
+    const i = corpo.search(/\s+vs\s+/i);
+    const lado = i >= 0 ? corpo.slice(0, i) : corpo;
+    mercado = `${rotulo[1]}: ${lado}`;
+    partida = i >= 0 ? lado.replace(/\s*\([+-]\d+(\.\d+)?\)/, "") + corpo.slice(i) : corpo;
+  }
   const resto = [];
   for (const p of partes.slice(1)) {
     if (mercado === null && PARECE_MERCADO.test(p)) mercado = p;
     else resto.push(p);
   }
-  return { partida: partes[0], mercado, campeonato: resto.length ? resto.join(" - ") : null };
+  return { partida, mercado, campeonato: resto.length ? resto.join(" - ") : null };
 }
 
 // uma chamada à API do Telegram (sendMessage). O token vai na URL, por isso a URL nunca é gravada nos registros.
