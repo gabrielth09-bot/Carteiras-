@@ -175,39 +175,8 @@ function separarTitulo(titulo) {
   }
   return { partida, mercado, campeonato: resto.length ? resto.join(" - ") : null };
 }
-// Formata a selecao real de um mercado de handicap.
-// Em títulos como "Map Handicap: ALL (-1.5)", o sinal se refere ao time ALL.
-// Se a carteira comprou o outcome oposto (ex.: PRIVATE), inverte-se o sinal.
-function formatarLinhaMercado(mercado, outcome) {
-  const m = String(mercado || "").trim();
-  const escolha = String(outcome || "?").trim();
-  const fallback = `${m || "Vencedor da partida"} — ${escolha}`;
-  const match = m.match(/^(Map\s+\d+\s+Handicap|Map\s+Handicap|Handicap)\s*:\s*(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/i);
-  if (!match) return fallback;
 
-  // Não reinterpretar mercados binários genéricos; só times/seleções nomeados.
-  if (!escolha || /^(yes|no|sim|não|true|false)$/i.test(escolha)) return fallback;
-  const timeDoTitulo = match[2].trim();
-  const linhaOriginal = Number(match[3].replace(",", "."));
-  if (!timeDoTitulo || !Number.isFinite(linhaOriginal)) return fallback;
-
-  const normalizarLado = value => String(value).trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
-  const mesmoLado = normalizarLado(escolha) === normalizarLado(timeDoTitulo);
-  const linhaEscolhida = mesmoLado ? linhaOriginal : -linhaOriginal;
-  const sinal = linhaEscolhida > 0 ? "+" : linhaEscolhida < 0 ? "-" : "";
-  const valor = Math.abs(linhaEscolhida).toLocaleString("en-US", {
-    useGrouping: false,
-    maximumFractionDigits: 4,
-  });
-  const nomeMercado = match[1].replace(/\s+/g, " ").trim();
-  const timeEscolhido = mesmoLado ? timeDoTitulo : escolha;
-
-  // No handicap, time e linha já descrevem a seleção; não repetir o outcome no fim.
-  return `${nomeMercado} — ${timeEscolhido} (${sinal}${valor})`;
-}
-
-// Retorna um confronto somente quando existem dois lados explicitamente separados por vs/versus.
-// Isso impede que títulos de mercado como "Games Total: O/U 2.5" virem nome de tópico.
+// Confronto só é reconhecido quando há dois lados explicitamente separados por vs/versus.
 function extrairConfronto(texto) {
   const s = String(texto || "").replace(/\s+/g, " ").trim();
   if (!s) return null;
@@ -228,24 +197,82 @@ function nomeDoJogo(partida) {
   return extrairConfronto(partida) || String(partida || "").trim();
 }
 
-// O campo title da Data API costuma ser o título do mercado, não o nome do evento.
-// Consultamos o slug do evento na Gamma API para recuperar o confronto verdadeiro.
-async function buscarNomeConfrontoEvento(eventSlug, orcamento) {
-  const slug = String(eventSlug || "").trim();
-  if (!slug || slug.length > 300) return null;
-  const url = `https://gamma-api.polymarket.com/events/slug/${encodeURIComponent(slug)}`;
-  const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "gamma");
-  if (!r.ok) return null;
-  let raw;
-  try { raw = await r.json(); } catch (_) { return null; }
-  const evento = Array.isArray(raw) ? raw[0] : raw;
-  if (!evento || typeof evento !== "object") return null;
-  const candidatos = [evento.title, evento.name, evento.subtitle, evento.ticker, evento.slug];
-  for (const candidato of candidatos) {
-    const confronto = extrairConfronto(candidato);
-    if (confronto) return confronto;
+// Em handicap, a seleção comprada identifica o time; o sinal da linha não é exibido.
+function formatarLinhaMercado(mercado, outcome) {
+  const m = String(mercado || "").trim();
+  const escolha = String(outcome || "?").trim();
+  const fallback = `${m || "Vencedor da partida"} — ${escolha}`;
+  const match = m.match(/^(Map\s+\d+\s+Handicap|Map\s+Handicap|Handicap)\s*:\s*(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/i);
+  if (!match) return fallback;
+  if (!escolha || /^(yes|no|sim|não|true|false)$/i.test(escolha)) return fallback;
+  const timeDoTitulo = match[2].trim();
+  const normalizarLado = value => String(value).trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+  const mesmoLado = normalizarLado(escolha) === normalizarLado(timeDoTitulo);
+  const nomeMercado = match[1].replace(/\s+/g, " ").trim();
+  const timeEscolhido = mesmoLado ? timeDoTitulo : escolha;
+  return `${nomeMercado} — ${timeEscolhido}`;
+}
+
+function primeiroTexto(...valores) {
+  for (const v of valores) {
+    if (typeof v === "string" && v.trim()) return v.trim();
   }
   return null;
+}
+function extrairDadosEvento(evento) {
+  if (!evento || typeof evento !== "object") return { confronto: null, campeonato: null, evento: null };
+  const confronto = [evento.title, evento.name, evento.subtitle, evento.ticker, evento.slug]
+    .map(extrairConfronto).find(Boolean) || null;
+  const serieRaw = evento.series;
+  const serie = Array.isArray(serieRaw) ? serieRaw[0] : serieRaw;
+  const campeonato = primeiroTexto(
+    evento.seriesTitle, evento.series_title, evento.tournamentName, evento.tournament_name,
+    evento.competitionName, evento.competition_name, evento.leagueName, evento.league_name,
+    evento.championshipName, evento.championship_name,
+    typeof serie === "object" && serie ? serie.title : null,
+    typeof serie === "object" && serie ? serie.name : null,
+    typeof serie === "object" && serie ? serie.subtitle : null,
+    typeof serie === "object" && serie ? serie.ticker : null
+  );
+  return { confronto, campeonato, evento };
+}
+
+async function buscarMetadadosEvento(eventSlug, orcamento, cache) {
+  const slug = String(eventSlug || "").trim();
+  if (!slug || slug.length > 300) return null;
+  if (cache.has(slug)) return cache.get(slug);
+  const url = `https://gamma-api.polymarket.com/events/slug/${encodeURIComponent(slug)}`;
+  const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "gamma");
+  if (!r.ok) {
+    cache.set(slug, null);
+    return null;
+  }
+  let raw;
+  try { raw = await r.json(); } catch (_) {
+    cache.set(slug, null);
+    return null;
+  }
+  const evento = Array.isArray(raw) ? raw[0] : raw;
+  const meta = extrairDadosEvento(evento);
+  cache.set(slug, meta);
+  return meta;
+}
+
+function inicioDaPartida(meta, conditionId) {
+  const evento = meta && meta.evento;
+  if (!evento || typeof evento !== "object") return 0;
+  const mercados = Array.isArray(evento.markets) ? evento.markets : [];
+  const mercado = mercados.find(m => m && String(m.conditionId || m.condition_id || "").toLowerCase() === String(conditionId || "").toLowerCase());
+  // gameStartTime é a fonte preferida para o horário previsto do jogo.
+  const candidato = primeiroTexto(
+    mercado && mercado.gameStartTime, mercado && mercado.game_start_time,
+    mercado && mercado.eventStartTime, mercado && mercado.event_start_time,
+    mercado && mercado.startTime, mercado && mercado.start_time,
+    evento.gameStartTime, evento.game_start_time,
+    evento.eventStartTime, evento.event_start_time,
+    evento.startTime, evento.start_time
+  );
+  return paraMs(candidato);
 }
 
 async function resolverNomeTopico(t, partida, orcamento, cache) {
@@ -253,15 +280,13 @@ async function resolverNomeTopico(t, partida, orcamento, cache) {
   if (direto) return direto;
   const eventSlug = String((t && t.eventSlug) || "").trim();
   if (!eventSlug) return null;
-  if (cache.has(eventSlug)) return cache.get(eventSlug);
-  let nome = null;
   try {
-    nome = await buscarNomeConfrontoEvento(eventSlug, orcamento);
+    const meta = await buscarMetadadosEvento(eventSlug, orcamento, cache);
+    return meta && meta.confronto ? meta.confronto : null;
   } catch (e) {
     console.warn("metadados do evento indisponiveis; nao sera criado topico com nome de mercado: " + String(e).slice(0, 120));
+    return null;
   }
-  cache.set(eventSlug, nome);
-  return nome;
 }
 
 async function enviarTelegram(env, texto, html, topico, orcamento) {
@@ -335,6 +360,7 @@ async function renomearTopico(env, topico, nome, orcamento) {
   if (d && /not modified/i.test(String(d.description || ""))) return true;
   throw new Error(d && d.description ? String(d.description).slice(0, 160) : "HTTP " + r.status);
 }
+
 async function lerTopicos(env) {
   const raw = await env.CFG.get(TOPICOS);
   if (!raw) return {};
@@ -645,13 +671,13 @@ async function vigiar(env) {
   }
 
   // Prepara tópicos de todo o lote e persiste o mapa UMA vez antes dos envios.
-  // Se a gravação do mapa falhar, os alertas que dependem dos novos tópicos ficam na fila.
+  // A cache de metadados também será reutilizada para campeonato e hora de início.
   const grupos = agruparPendentes(state.pending);
   const lote = grupos.slice(0, MAX_AVISOS_POR_RODADA);
   const topicos = lote.length ? await lerTopicos(env) : null;
   const topicByGroup = new Map();
   const groupsNeedingTopicCommit = new Set();
-  const nomesEventoResolvidos = new Map();
+  const metadadosEventos = new Map();
   let topicosMudou = false;
   if (topicos) {
     for (const g of lote) {
@@ -662,17 +688,11 @@ async function vigiar(env) {
       const salvo = topicos[keyTopic];
       const salvoNome = salvo && typeof salvo === "object" ? String(salvo.nome || "") : "";
       let topicId = idTopico(salvo);
-
-      // Reaproveita nomes de confronto ja corretos; se o nome salvo e um mercado,
-      // resolve o nome real do evento e renomeia o topico existente sem mudar seu ID.
       let nomeTopico = extrairConfronto(salvoNome);
-      if (!nomeTopico) {
-        nomeTopico = await resolverNomeTopico(t, partida, orcamento, nomesEventoResolvidos);
-      }
+      if (!nomeTopico) nomeTopico = await resolverNomeTopico(t, partida, orcamento, metadadosEventos);
 
       if (!topicId) {
         if (!nomeTopico) {
-          // Melhor enviar ao chat geral do que criar um novo topico chamado "Under/Over" ou nome de mercado.
           console.warn("topico nao criado: confronto nao identificado com seguranca para " + String(t.eventSlug || partida).slice(0, 120));
           topicByGroup.set(g, { id: null, keyTopic, nome: null });
           continue;
@@ -684,7 +704,7 @@ async function vigiar(env) {
           groupsNeedingTopicCommit.add(g);
         } catch (e) {
           console.error("criar topico falhou: " + limpar(env, e));
-          topicId = null; // O aviso vai para a conversa geral; não bloqueia a fila.
+          topicId = null;
         }
       } else if (nomeTopico && nomeTopico !== salvoNome) {
         try {
@@ -697,8 +717,6 @@ async function vigiar(env) {
           nomeTopico = salvoNome || nomeTopico;
         }
       }
-      // Se a consulta de metadados falhar para um topico antigo, preserva o ID atual,
-      // mas nao usa seu nome errado para recriar um topico caso o Telegram o tenha apagado.
       if (!nomeTopico && topicId && salvoNome) nomeTopico = salvoNome;
       topicByGroup.set(g, { id: topicId, keyTopic, nome: nomeTopico });
     }
@@ -714,7 +732,8 @@ async function vigiar(env) {
 
   // Envio é separado da descoberta; filas que falham continuam persistidas para a próxima rodada.
   const entregues = new Set();
-  for (const g of lote) {
+  for (let indiceGrupo = 0; indiceGrupo < lote.length; indiceGrupo++) {
+    const g = lote[indiceGrupo];
     if (orcamento.total >= MAX_TOTAL_FETCHES) break;
     if (groupsNeedingTopicCommit.has(g) && !topicosCommitOk) continue;
     const t = g.t;
@@ -723,9 +742,17 @@ async function vigiar(env) {
     const venda = String(t.side || "").toUpperCase() === "SELL";
     const nomeCarteira = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
     const { partida, mercado, campeonato } = separarTitulo(t.title || t.slug || "?");
+    let metaEvento = t.eventSlug ? metadadosEventos.get(String(t.eventSlug).trim()) || null : null;
+    // Só consulta a Gamma se houver margem para preservar o envio de todo o lote.
+    const reservaEnviosRestantes = (lote.length - indiceGrupo) * 2;
+    if (!metaEvento && t.eventSlug && orcamento.total + 1 + reservaEnviosRestantes <= MAX_TOTAL_FETCHES) {
+      try { metaEvento = await buscarMetadadosEvento(t.eventSlug, orcamento, metadadosEventos); }
+      catch (e) { console.warn("nao foi possivel consultar metadados para enriquecer o alerta: " + String(e).slice(0, 120)); }
+    }
     const mercadoMensagem = mercado || (t.title && PARECE_MERCADO.test(t.title) && !extrairConfronto(t.title) ? t.title : null);
+    const inicioMs = inicioDaPartida(metaEvento, t.conditionId);
+    const campeonatoMensagem = campeonato || (metaEvento && metaEvento.campeonato) || null;
     // Sem título personalizado: tudo é texto simples para facilitar copiar a mensagem.
-    // O nome da carteira e o valor ficam na primeira linha; o separador testado no Telegram fecha o alerta.
     const titulo = "";
     const linhas = [
       `${nomeCarteira} — ${moeda(g.custo)}`,
@@ -734,7 +761,8 @@ async function vigiar(env) {
       "",
       `Odd da compra: ${odd}`,
       `Horário da aposta: ${horaBrasilia(g.ms)}`,
-      campeonato || null,
+      campeonatoMensagem ? `Campeonato: ${campeonatoMensagem}` : null,
+      inicioMs ? `Início da partida: ${horaBrasilia(inicioMs).slice(0, 5)}` : null,
       "───────────────────",
     ].filter(x => x !== null);
     const corpo = linhas.join("\n");
@@ -743,7 +771,7 @@ async function vigiar(env) {
     let result = await avisar(env, titulo, corpo, "", topicId, orcamento);
     if (!result.ok && topicId && /thread/i.test(result.desc) && topicos) {
       try {
-        const nomeSubstituto = extrairConfronto(prepared.nome);
+        const nomeSubstituto = extrairConfronto(prepared.nome) || extrairConfronto(partida) || (metaEvento && metaEvento.confronto);
         if (!nomeSubstituto) throw new Error("confronto nao identificado; recusando criar topico com nome de mercado");
         const replacement = await criarTopico(env, nomeSubstituto, orcamento);
         topicos[prepared.keyTopic] = { id: replacement, nome: nomeSubstituto };
