@@ -295,6 +295,16 @@ async function buscarMetadadosEvento(eventSlug, orcamento, cache) {
   return meta;
 }
 
+// Retorna o primeiro valor de data/hora utilizável encontrado nos metadados.
+// Aceita ISO strings e timestamps numéricos; ignora strings vazias e valores inválidos.
+function primeiroTexto(...valores) {
+  for (const valor of valores) {
+    if (typeof valor === "string" && valor.trim()) return valor.trim();
+    if (typeof valor === "number" && Number.isFinite(valor) && valor > 0) return valor;
+  }
+  return null;
+}
+
 function inicioDaPartida(meta, conditionId) {
   const evento = meta && meta.evento;
   if (!evento || typeof evento !== "object") return 0;
