@@ -222,7 +222,9 @@ const NOMES_JOGO_ESPORTS = new Set([
   "dota", "dota 2", "league of legends", "lol", "valorant", "val", "rocket league",
   "rainbow six", "rainbow six siege", "r6 siege", "call of duty", "cod", "overwatch",
   "overwatch 2", "starcraft", "starcraft 2", "starcraft ii", "mobile legends", "mlbb",
-  "honor of kings", "king of glory", "arena of valor", "age of empires", "esports", "e sports"
+  "honor of kings", "king of glory", "arena of valor", "age of empires", "esports", "e sports",
+  // Categorias genéricas da API não são nomes de campeonatos.
+  "game", "games", "video games", "sport", "sports", "gaming", "competitive gaming"
 ]);
 function nomeGenericoDeJogo(valor) {
   return NOMES_JOGO_ESPORTS.has(chaveTexto(valor));
@@ -268,8 +270,9 @@ function extrairDadosEvento(evento) {
     typeof serie === "object" && serie ? serie.name : null,
     typeof serie === "object" && serie ? serie.subtitle : null,
     typeof serie === "object" && serie ? serie.ticker : null,
-    torneio,
-    evento.tags
+    torneio
+    // Não usar evento.tags como fonte de campeonato: a Gamma frequentemente devolve
+    // etiquetas de categoria como "Games" ou "Sports", não o nome do torneio.
   );
   return { confronto, campeonato, evento };
 }
