@@ -213,9 +213,43 @@ function formatarLinhaMercado(mercado, outcome) {
   return `${nomeMercado} — ${timeEscolhido}`;
 }
 
-function primeiroTexto(...valores) {
+function chaveTexto(valor) {
+  return String(valor || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().replace(/\s+/g, " ");
+}
+const NOMES_JOGO_ESPORTS = new Set([
+  "counter strike", "counter strike 2", "counter strike global offensive", "cs2", "csgo", "cs go",
+  "dota", "dota 2", "league of legends", "lol", "valorant", "val", "rocket league",
+  "rainbow six", "rainbow six siege", "r6 siege", "call of duty", "cod", "overwatch",
+  "overwatch 2", "starcraft", "starcraft 2", "starcraft ii", "mobile legends", "mlbb",
+  "honor of kings", "king of glory", "arena of valor", "age of empires", "esports", "e sports"
+]);
+function nomeGenericoDeJogo(valor) {
+  return NOMES_JOGO_ESPORTS.has(chaveTexto(valor));
+}
+// Evita que o nome do próprio jogo (ex.: "Dota 2" ou "Counter Strike") seja exibido como campeonato.
+// Se o título combinar jogo e torneio, remove apenas o segmento que identifica o jogo.
+function normalizarCampeonato(valor) {
+  if (typeof valor !== "string" || !valor.trim()) return null;
+  const partes = valor.trim().split(/\s+(?:-|–|—|\|)\s+/).map(p => p.trim()).filter(Boolean);
+  const validas = partes.filter(p => !nomeGenericoDeJogo(p) && !/^(esports|e-sports|gaming)$/i.test(p));
+  const resultado = validas.join(" - ").replace(/^campeonato\s*:\s*/i, "").trim();
+  return resultado && !nomeGenericoDeJogo(resultado) ? resultado : null;
+}
+function primeiroCampeonato(...valores) {
   for (const v of valores) {
-    if (typeof v === "string" && v.trim()) return v.trim();
+    if (Array.isArray(v)) {
+      const achado = primeiroCampeonato(...v);
+      if (achado) return achado;
+      continue;
+    }
+    if (v && typeof v === "object") {
+      const achado = primeiroCampeonato(v.label, v.title, v.name, v.subtitle, v.ticker);
+      if (achado) return achado;
+      continue;
+    }
+    const nome = normalizarCampeonato(v);
+    if (nome) return nome;
   }
   return null;
 }
@@ -225,14 +259,17 @@ function extrairDadosEvento(evento) {
     .map(extrairConfronto).find(Boolean) || null;
   const serieRaw = evento.series;
   const serie = Array.isArray(serieRaw) ? serieRaw[0] : serieRaw;
-  const campeonato = primeiroTexto(
+  const torneio = evento.tournament || evento.competition || evento.league;
+  const campeonato = primeiroCampeonato(
     evento.seriesTitle, evento.series_title, evento.tournamentName, evento.tournament_name,
     evento.competitionName, evento.competition_name, evento.leagueName, evento.league_name,
     evento.championshipName, evento.championship_name,
     typeof serie === "object" && serie ? serie.title : null,
     typeof serie === "object" && serie ? serie.name : null,
     typeof serie === "object" && serie ? serie.subtitle : null,
-    typeof serie === "object" && serie ? serie.ticker : null
+    typeof serie === "object" && serie ? serie.ticker : null,
+    torneio,
+    evento.tags
   );
   return { confronto, campeonato, evento };
 }
@@ -678,6 +715,15 @@ async function vigiar(env) {
   const topicByGroup = new Map();
   const groupsNeedingTopicCommit = new Set();
   const metadadosEventos = new Map();
+  // Alguns títulos de mercado incluem o torneio e outros, da mesma partida, incluem apenas o jogo.
+  // Aproveita um nome válido encontrado em qualquer mercado do lote para padronizar os alertas do evento.
+  const campeonatosPorEvento = new Map();
+  for (const grupo of lote) {
+    const slugEvento = String(grupo.t && grupo.t.eventSlug || "").trim();
+    if (!slugEvento || campeonatosPorEvento.has(slugEvento)) continue;
+    const nome = normalizarCampeonato(separarTitulo(grupo.t.title || grupo.t.slug || "?").campeonato);
+    if (nome) campeonatosPorEvento.set(slugEvento, nome);
+  }
   let topicosMudou = false;
   if (topicos) {
     for (const g of lote) {
@@ -751,7 +797,10 @@ async function vigiar(env) {
     }
     const mercadoMensagem = mercado || (t.title && PARECE_MERCADO.test(t.title) && !extrairConfronto(t.title) ? t.title : null);
     const inicioMs = inicioDaPartida(metaEvento, t.conditionId);
-    const campeonatoMensagem = campeonato || (metaEvento && metaEvento.campeonato) || null;
+    const campeonatoMensagem = normalizarCampeonato(metaEvento && metaEvento.campeonato)
+      || normalizarCampeonato(campeonato)
+      || campeonatosPorEvento.get(String(t.eventSlug || "").trim())
+      || null;
     // Sem título personalizado: tudo é texto simples para facilitar copiar a mensagem.
     const titulo = "";
     const linhas = [
