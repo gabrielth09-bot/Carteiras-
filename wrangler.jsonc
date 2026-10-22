@@ -1,11 +1,19 @@
+
 {
   "name": "monitor-carteiras-v2",
   "main": "worker.js",
   "compatibility_date": "2026-10-01",
   "kv_namespaces": [
-    { "binding": "CFG", "id": "b1703649ef05417f934909597738ea8a" }
+    {
+      "binding": "CFG",
+      "id": "2cc16d36e0784ac59fa5bd0685b986f9"
+    }
   ],
-  "triggers": { "crons": ["* * * * *"] },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "keep_vars": true,
-  "observability": { "enabled": true }
+  "observability": {
+    "enabled": true
+  }
 }
