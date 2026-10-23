@@ -1,23 +1,22 @@
-// Worker Polymarket -> Telegram
-// Compatibilidade: KV CFG, secret CHAVE, TELEGRAM_BOT_TOKEN, variável TELEGRAM_CHAT_ID,
+// Worker Polymarket -> Telegram — versão corrigida após auditoria
+// Compatibilidade: KV CFG, secret CHAVE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
 // Cron * * * * *, endpoints POST /config e POST /notify, payload { carteiras: [{w, nome}] }.
-// Estado persistente na chave estado3; migra de estado2 e preserva topicos.
+// Estado persistente em estado3; migra de estado2 e preserva topicos.
 // Entrega at-least-once: uma falha de KV depois do envio pode causar duplicata, nunca uma confirmação falsa.
 
 const DATA = "https://data-api.polymarket.com";
 const ESPORT = /(?:^|[-_])(lol|league-of-legends|cs2?|csgo|counter-strike|dota2?|dota-2|valorant|val|r6(?:siege)?|codmw|cod|ow|rl|rocket-league|kog|hok|mlbb|sc2|starcraft)(?:[-_]|$)/i;
 
-// Plano Workers Free: no máximo 50 subrequests externas por invocação.
-// Deixamos folga para retentativas do Telegram e criação de tópicos.
-const LIMITE_V2 = 100; // limite deliberadamente menor que o máximo da API para limitar CPU/memória
+// Workers Free: no máximo 50 subrequests externas por invocação.
+const LIMITE_V2 = 100;
 const LIMITE_V1 = 100;
 const MAX_PAGINAS_POR_CARTEIRA_RODADA = 3;
 const MAX_CARTEIRAS = 20;
-const MAX_AVISOS_POR_RODADA = 8; // lote de envio; excedente continua na fila
+const MAX_AVISOS_POR_RODADA = 8;
 const MAX_DATA_CALLS = 24;
 const MAX_TOTAL_FETCHES = 48;
-const MAX_CONCURRENT_FETCHES = 4; // abaixo do limite de seis conexões simultâneas do Workers
-const MAX_PENDING = 3000; // ao alcançar, pausa novas consultas e drena a fila sem descartar itens
+const MAX_CONCURRENT_FETCHES = 4;
+const MAX_PENDING = 3000;
 const MAX_SEEN_PER_WALLET = 1500;
 const OVERLAP_SECONDS = 120;
 const API_INGESTION_LAG_SECONDS = 20;
@@ -82,16 +81,21 @@ function normalizar(t) {
     title: t.title || t.market || "",
     outcome: t.outcome || t.outcome_name || "?",
     side: t.side || "",
+    tokenId: t.tokenId || t.token_id || "",
     size: t.size,
     price: t.price,
     timestamp: t.timestamp || t.block_timestamp || t.match_time || t.created_at || 0,
     transactionHash: t.transactionHash || t.transaction_hash || t.txHash || t.tx_hash || "",
   };
 }
-// Mantém a chave compatível com estado3 produzido pela versão anterior, para não duplicar a fila antiga.
-function chave(t) {
+// Chave antiga mantida para migração compatível com estado3 de versões anteriores.
+function chaveAntiga(t) {
   return [t.transactionHash || "", t.conditionId, Math.floor(paraMs(t.timestamp) / 1000),
     Number(t.size).toFixed(4), Number(t.price).toFixed(4), t.outcome].join("|");
+}
+// A nova chave distingue lado e token, evitando colisões entre operações quase idênticas.
+function chave(t) {
+  return [chaveAntiga(t), String(t.side || "").toUpperCase(), String(t.tokenId || "")].join("|");
 }
 function idPendente(w, t) { return `${w}|${chave(t)}`; }
 function cursorDe(body) {
@@ -100,13 +104,12 @@ function cursorDe(body) {
   return p.next_cursor || p.nextCursor || body.next_cursor || body.nextCursor || null;
 }
 function listaDe(body) {
-  if (Array.isArray(body)) return body; // compatibilidade com a API v1
+  if (Array.isArray(body)) return body;
   if (body && Array.isArray(body.data)) return body.data;
   if (body && Array.isArray(body.events)) return body.events;
   throw new Error("resposta inesperada da Data API: lista de trades ausente");
 }
 function eEsports(t) {
-  // Não deixa um eventSlug não relacionado esconder um slug de mercado que identifica e-sports.
   const slugs = [t.eventSlug, t.event_slug, t.slug, t.marketSlug, t.market_slug]
     .filter(x => typeof x === "string" && x.trim());
   return slugs.some(s => ESPORT.test(s));
@@ -128,7 +131,6 @@ function montarUrlTrades(w, start, end, cursor = null, api = "v2", offset = 0) {
   u.searchParams.set("start", String(start));
   u.searchParams.set("end", String(end));
   if (v2 && cursor) u.searchParams.set("cursor", String(cursor));
-  // O endpoint legado usa offset. O cursor v2 não deve ser misturado a offset.
   if (!v2 && offset > 0) u.searchParams.set("offset", String(offset));
   return u.toString();
 }
@@ -154,23 +156,28 @@ function horaBrasilia(ms) {
     return new Date(ms).toISOString().slice(11, 19);
   }
 }
-const PARECE_MERCADO = /\b(winner|moneyline|handicap|spread|total|kills?|first blood|over|under)\b|\b(map|mapa|game|jogo|round|set)\s*\d+\b/i;
-const ROTULO_MERCADO = /^(map handicap|handicap|map \d+ handicap|total maps|total kills|map \d+ winner|first blood)\s*:/i;
+
+// Tipos de mercado aceitos no começo do título. Importante: Game Handicap estava ausente.
+const ROTULO_MERCADO = /^(?:game\s+(?:\d+\s+)?(?:handicap|winner)|map\s+(?:\d+\s+)?(?:handicap|winner)|match\s+(?:handicap|winner)|handicap|spread|moneyline|winner|total\s+maps|total\s+kills|first\s+blood)$/i;
+const PARECE_MERCADO = /\b(?:game|map|match)\s*(?:\d+\s*)?(?:winner|handicap)\b|\b(winner|moneyline|handicap|spread|total|kills?|first blood|over|under)\b|\b(map|mapa|game|jogo|round|set)\s*\d+\b/i;
+const ROTULO_COM_DETALHE = /^(game\s+(?:\d+\s+)?(?:handicap|winner)|map\s+(?:\d+\s+)?(?:handicap|winner)|match\s+(?:handicap|winner)|handicap|spread|moneyline|winner|total\s+maps|total\s+kills|first\s+blood)\s*:\s*(.+)$/i;
+
+// Reconhece mercado como "Game Handicap: 1WIN (+1.5) vs OG (-1.5)" sem tratar "Game Handicap" como time.
 function separarTitulo(titulo) {
-  const partes = String(titulo).split(" - ").map(p => p.trim());
-  let partida = partes[0];
+  const partes = String(titulo).split(/\s+-\s+/).map(p => p.trim());
+  let partida = partes[0] || "";
   let mercado = null;
   const rotulo = partida.match(/^([^:]+):\s*(.+)$/);
-  if (rotulo && ROTULO_MERCADO.test(partida)) {
-    const corpo = rotulo[2];
-    const i = corpo.search(/\s+vs\s+/i);
-    const lado = i >= 0 ? corpo.slice(0, i) : corpo;
-    mercado = `${rotulo[1]}: ${lado}`;
-    partida = i >= 0 ? lado.replace(/\s*\([+-]\d+(\.\d+)?\)/, "") + corpo.slice(i) : corpo;
+  if (rotulo && ROTULO_MERCADO.test(rotulo[1].trim())) {
+    mercado = `${rotulo[1].trim()}: ${rotulo[2].trim()}`;
+    const corpo = rotulo[2].trim();
+    const i = corpo.search(/\s+vs\.?\s+|\s+versus\s+/i);
+    partida = i >= 0 ? corpo.slice(0, i).replace(/\s*\([+-]\d+(?:[.,]\d+)?\)/, "") + corpo.slice(i) : corpo;
   }
   const resto = [];
   for (const p of partes.slice(1)) {
-    if (mercado === null && PARECE_MERCADO.test(p)) mercado = p;
+    if (mercado === null && ROTULO_MERCADO.test(p)) mercado = p;
+    else if (mercado === null && PARECE_MERCADO.test(p) && !extrairConfronto(p)) mercado = p;
     else resto.push(p);
   }
   return { partida, mercado, campeonato: resto.length ? resto.join(" - ") : null };
@@ -192,25 +199,44 @@ function extrairConfronto(texto) {
   if (!esquerda || !direita || /^(?:o\/u|over|under|yes|no)$/i.test(esquerda)) return null;
   return `${esquerda} vs ${direita}`.slice(0, 100);
 }
-
 function nomeDoJogo(partida) {
   return extrairConfronto(partida) || String(partida || "").trim();
 }
+function normalizarEquipe(valor) {
+  return String(valor || "").replace(/\s*\([+-]?\d+(?:[.,]\d+)?\)\s*/g, " ")
+    .replace(/\s+/g, " ").trim().toLocaleLowerCase("en-US");
+}
 
-// Em handicap, a seleção comprada identifica o time; o sinal da linha não é exibido.
+// Nunca assume "Vencedor da partida" quando o tipo do mercado não foi identificado.
+// Para handicap, tenta associar a linha numérica à seleção correta, quando o título a contém.
 function formatarLinhaMercado(mercado, outcome) {
   const m = String(mercado || "").trim();
   const escolha = String(outcome || "?").trim();
-  const fallback = `${m || "Vencedor da partida"} — ${escolha}`;
-  const match = m.match(/^(Map\s+\d+\s+Handicap|Map\s+Handicap|Handicap)\s*:\s*(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/i);
-  if (!match) return fallback;
-  if (!escolha || /^(yes|no|sim|não|true|false)$/i.test(escolha)) return fallback;
-  const timeDoTitulo = match[2].trim();
-  const normalizarLado = value => String(value).trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
-  const mesmoLado = normalizarLado(escolha) === normalizarLado(timeDoTitulo);
-  const nomeMercado = match[1].replace(/\s+/g, " ").trim();
-  const timeEscolhido = mesmoLado ? timeDoTitulo : escolha;
-  return `${nomeMercado} — ${timeEscolhido}`;
+  if (!m) return `Mercado não identificado — ${escolha}`;
+
+  const comDetalhe = m.match(ROTULO_COM_DETALHE);
+  if (comDetalhe) {
+    const rotulo = comDetalhe[1].replace(/\s+/g, " ").trim();
+    const corpo = comDetalhe[2].trim();
+    if (/handicap/i.test(rotulo) || /spread/i.test(rotulo)) {
+      const lados = corpo.split(/\s+vs\.?\s+|\s+versus\s+/i);
+      const alvo = normalizarEquipe(escolha);
+      for (const lado of lados) {
+        const linha = lado.match(/^(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/);
+        if (linha && normalizarEquipe(linha[1]) === alvo) {
+          const valorLinha = linha[2].replace(",", ".");
+          return `${rotulo} — ${escolha} (${Number(valorLinha) > 0 ? "+" : ""}${valorLinha})`;
+        }
+      }
+      const unicaLinha = corpo.match(/^(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)\s*$/);
+      if (unicaLinha && normalizarEquipe(unicaLinha[1]) === alvo) {
+        const valorLinha = unicaLinha[2].replace(",", ".");
+        return `${rotulo} — ${escolha} (${Number(valorLinha) > 0 ? "+" : ""}${valorLinha})`;
+      }
+    }
+    return `${rotulo} — ${escolha}`;
+  }
+  return `${m} — ${escolha}`;
 }
 
 function chaveTexto(valor) {
@@ -223,14 +249,11 @@ const NOMES_JOGO_ESPORTS = new Set([
   "rainbow six", "rainbow six siege", "r6 siege", "call of duty", "cod", "overwatch",
   "overwatch 2", "starcraft", "starcraft 2", "starcraft ii", "mobile legends", "mlbb",
   "honor of kings", "king of glory", "arena of valor", "age of empires", "esports", "e sports",
-  // Categorias genéricas da API não são nomes de campeonatos.
   "game", "games", "video games", "sport", "sports", "gaming", "competitive gaming"
 ]);
 function nomeGenericoDeJogo(valor) {
   return NOMES_JOGO_ESPORTS.has(chaveTexto(valor));
 }
-// Evita que o nome do próprio jogo (ex.: "Dota 2" ou "Counter Strike") seja exibido como campeonato.
-// Se o título combinar jogo e torneio, remove apenas o segmento que identifica o jogo.
 function normalizarCampeonato(valor) {
   if (typeof valor !== "string" || !valor.trim()) return null;
   const partes = valor.trim().split(/\s+(?:-|–|—|\|)\s+/).map(p => p.trim()).filter(Boolean);
@@ -271,8 +294,6 @@ function extrairDadosEvento(evento) {
     typeof serie === "object" && serie ? serie.subtitle : null,
     typeof serie === "object" && serie ? serie.ticker : null,
     torneio
-    // Não usar evento.tags como fonte de campeonato: a Gamma frequentemente devolve
-    // etiquetas de categoria como "Games" ou "Sports", não o nome do torneio.
   );
   return { confronto, campeonato, evento };
 }
@@ -297,9 +318,6 @@ async function buscarMetadadosEvento(eventSlug, orcamento, cache) {
   cache.set(slug, meta);
   return meta;
 }
-
-// Retorna o primeiro valor de data/hora utilizável encontrado nos metadados.
-// Aceita ISO strings e timestamps numéricos; ignora strings vazias e valores inválidos.
 function primeiroTexto(...valores) {
   for (const valor of valores) {
     if (typeof valor === "string" && valor.trim()) return valor.trim();
@@ -307,13 +325,11 @@ function primeiroTexto(...valores) {
   }
   return null;
 }
-
 function inicioDaPartida(meta, conditionId) {
   const evento = meta && meta.evento;
   if (!evento || typeof evento !== "object") return 0;
   const mercados = Array.isArray(evento.markets) ? evento.markets : [];
   const mercado = mercados.find(m => m && String(m.conditionId || m.condition_id || "").toLowerCase() === String(conditionId || "").toLowerCase());
-  // gameStartTime é a fonte preferida para o horário previsto do jogo.
   const candidato = primeiroTexto(
     mercado && mercado.gameStartTime, mercado && mercado.game_start_time,
     mercado && mercado.eventStartTime, mercado && mercado.event_start_time,
@@ -324,7 +340,6 @@ function inicioDaPartida(meta, conditionId) {
   );
   return paraMs(candidato);
 }
-
 async function resolverNomeTopico(t, partida, orcamento, cache) {
   const direto = extrairConfronto(partida) || extrairConfronto(t && t.title);
   if (direto) return direto;
@@ -423,7 +438,6 @@ async function lerTopicos(env) {
     return null;
   }
 }
-
 function idTopico(valor) {
   if (valor && typeof valor === "object") return valor.id || null;
   const n = Number(valor);
@@ -448,13 +462,10 @@ function agruparPendentes(pendentes) {
     if (ms && (!g.ms || ms < g.ms)) g.ms = ms;
     if (!g.t.title && t.title) g.t = t;
   }
-  // Prioriza os grupos mais antigos para não deixar um mercado de baixo volume eternamente na fila.
   return [...grupos.values()].sort((a, b) => (a.ms || 0) - (b.ms || 0));
 }
-
 function normalizarChaves(valor) {
   if (Array.isArray(valor)) return [...new Set(valor.filter(x => typeof x === "string"))];
-  // Algumas versões antigas guardavam um mapa chave -> true em vez de uma lista.
   if (valor && typeof valor === "object") return Object.keys(valor).filter(k => valor[k]);
   return [];
 }
@@ -476,7 +487,6 @@ async function carregarEstado(env) {
     const seen = {};
     for (const [w, keys] of Object.entries(s.seen)) seen[w] = normalizarChaves(keys);
     const sync = s.sync && typeof s.sync === "object" ? s.sync : {};
-    // A presença de um ciclo no KV significa que o cursor foi persistido em uma execução anterior.
     for (const p of Object.values(sync)) if (p && p.cycle && typeof p.cycle === "object") p.cycle.persisted = true;
     return {
       version: 4,
@@ -509,11 +519,8 @@ function iniciarCiclo(progresso, since, agora) {
 }
 function temMaisDaResposta(api, body, rows) {
   if (api === "v2") return cursorDe(body);
-  // Endpoint legado: se a pagina veio cheia, tenta a pagina seguinte por offset.
   return rows.length >= LIMITE_V1 ? `v1:${rows.length}` : null;
 }
-function chavePendentePresente(state, id) { return state.pending.some(p => p.id === id); }
-
 async function pedirPaginaV2(w, cycle, orcamento) {
   const url = montarUrlTrades(w, cycle.start, cycle.end, cycle.cursor, "v2", 0);
   const r = await fetchControlado(url, { headers: { Accept: "application/json" } }, orcamento, "data");
@@ -555,7 +562,6 @@ async function buscarProcessarPagina(c, state, pendingIds, orcamento, flags) {
       try {
         page = await pedirPaginaV2(w, cycle, orcamento);
       } catch (e) {
-        // Falhas transitórias/restrição de recursos não devem provocar consulta de reserva em duplicidade.
         const terminalV2 = e && [400, 404, 405].includes(Number(e.status));
         if (cycle.pages > 0 || !terminalV2) throw e;
         console.error(`v2 recusou a consulta da carteira ${w.slice(0, 6)}...; tentando v1: ${limpar(flags.env, e)}`);
@@ -578,13 +584,16 @@ async function buscarProcessarPagina(c, state, pendingIds, orcamento, flags) {
 
   for (const t of rows) {
     const ms = paraMs(t.timestamp);
-    // Sem timestamp não é possível respeitar a regra de não alertar operações anteriores à ativação.
     if (!ms || ms < sinceMs || ms < cycleStartMs || ms > cycleEndMs) continue;
     const k = chave(t);
+    const kAntiga = chaveAntiga(t);
     if (!seen.has(k)) { seen.add(k); seenChanged = true; }
     const id = idPendente(w, t);
-    if (pendingIds.has(id)) continue;
-    if (state.seen[w] && state.seen[w].includes(k)) continue;
+    const jaPendenteNaChaveAntiga = state.pending.some(p => p && p.c && p.c.w.toLowerCase() === w
+      && p.t && chaveAntiga(p.t) === kAntiga);
+    if (pendingIds.has(id) || jaPendenteNaChaveAntiga) continue;
+    // Evita reenviar operações vistas antes da mudança de formato da chave.
+    if (seenArray.includes(k) || seenArray.includes(kAntiga)) continue;
     state.pending.push({ id, c: { w, nome: String(c.nome || "").slice(0, 40) }, t });
     pendingIds.add(id);
     flags.novos++;
@@ -610,14 +619,14 @@ async function buscarProcessarPagina(c, state, pendingIds, orcamento, flags) {
   }
   if (cycle.cursor) {
     cycle.persisted = true;
-    flags.dirty = true; // Cursor persistente para continuar paginação na próxima execução.
+    flags.dirty = true;
     return { ok: true, more: true, attempted: true };
   }
 
   const cycleHadBeenPersisted = cycle.persisted === true;
   progress.watermark = cycle.end;
   progress.cycle = null;
-  if (cycleHadBeenPersisted) flags.dirty = true; // Remove ciclo persistido e confirma o checkpoint concluído.
+  if (cycleHadBeenPersisted) flags.dirty = true;
   flags.completados++;
   return { ok: true, more: false, attempted: true };
 }
@@ -646,8 +655,6 @@ async function vigiar(env) {
   state.sync = existingSync;
   const activeWallets = new Set(carteiras.map(c => c.w));
   const queuedWallets = new Set(state.pending.map(p => p.c.w.toLowerCase()));
-  // Limpeza de estado antigo dentro da gravação periódica, não no POST /config,
-  // para evitar que uma gravação concorrente da configuração sobrescreva estado recém-atualizado.
   for (const w of Object.keys(state.seen)) {
     if (!activeWallets.has(w.toLowerCase()) && !queuedWallets.has(w.toLowerCase())) {
       delete state.seen[w]; flags.dirty = true;
@@ -676,9 +683,7 @@ async function vigiar(env) {
   };
   const pendingIds = new Set(state.pending.map(p => p.id));
 
-  // Backlog alto: não avança cursores nem consulta mais operações; primeiro drena a fila.
   if (state.pending.length < MAX_PENDING && carteiras.length) {
-    // Um ciclo novo é preparado em memória; ciclos com cursor são persistidos quando necessário.
     for (const c of carteiras) {
       const p = state.sync[c.w];
       if (!p.cycle) iniciarCiclo(p, c.since, nowSec);
@@ -699,7 +704,6 @@ async function vigiar(env) {
       if (r.ok && r.more) resumo.paginasIncompletas++;
     });
 
-    // Paginacao adicional justa: no maximo 8 chamadas extras de dados, em ordem rotativa.
     while (orcamento.data < MAX_DATA_CALLS && orcamento.total < MAX_TOTAL_FETCHES) {
       const candidatos = ordem.map(i => carteiras[i]).filter(c => {
         const p = state.sync[c.w];
@@ -720,16 +724,12 @@ async function vigiar(env) {
     console.warn(`backlog com ${state.pending.length} itens; novas consultas pausadas para priorizar a fila`);
   }
 
-  // Prepara tópicos de todo o lote e persiste o mapa UMA vez antes dos envios.
-  // A cache de metadados também será reutilizada para campeonato e hora de início.
   const grupos = agruparPendentes(state.pending);
   const lote = grupos.slice(0, MAX_AVISOS_POR_RODADA);
   const topicos = lote.length ? await lerTopicos(env) : null;
   const topicByGroup = new Map();
   const groupsNeedingTopicCommit = new Set();
   const metadadosEventos = new Map();
-  // Alguns títulos de mercado incluem o torneio e outros, da mesma partida, incluem apenas o jogo.
-  // Aproveita um nome válido encontrado em qualquer mercado do lote para padronizar os alertas do evento.
   const campeonatosPorEvento = new Map();
   for (const grupo of lote) {
     const slugEvento = String(grupo.t && grupo.t.eventSlug || "").trim();
@@ -789,7 +789,6 @@ async function vigiar(env) {
     }
   }
 
-  // Envio é separado da descoberta; filas que falham continuam persistidas para a próxima rodada.
   const entregues = new Set();
   for (let indiceGrupo = 0; indiceGrupo < lote.length; indiceGrupo++) {
     const g = lote[indiceGrupo];
@@ -797,31 +796,32 @@ async function vigiar(env) {
     if (groupsNeedingTopicCommit.has(g) && !topicosCommitOk) continue;
     const t = g.t;
     const pm = g.cotas > 0 ? g.custo / g.cotas : 0;
-    const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
     const venda = String(t.side || "").toUpperCase() === "SELL";
+    const odd = pm > 0 ? (1 / pm).toFixed(2).replace(".", ",") : "-";
     const nomeCarteira = g.c.nome || (g.c.w.slice(0, 6) + "..." + g.c.w.slice(-4));
     const { partida, mercado, campeonato } = separarTitulo(t.title || t.slug || "?");
     let metaEvento = t.eventSlug ? metadadosEventos.get(String(t.eventSlug).trim()) || null : null;
-    // Só consulta a Gamma se houver margem para preservar o envio de todo o lote.
     const reservaEnviosRestantes = (lote.length - indiceGrupo) * 2;
     if (!metaEvento && t.eventSlug && orcamento.total + 1 + reservaEnviosRestantes <= MAX_TOTAL_FETCHES) {
       try { metaEvento = await buscarMetadadosEvento(t.eventSlug, orcamento, metadadosEventos); }
       catch (e) { console.warn("nao foi possivel consultar metadados para enriquecer o alerta: " + String(e).slice(0, 120)); }
     }
-    const mercadoMensagem = mercado || (t.title && PARECE_MERCADO.test(t.title) && !extrairConfronto(t.title) ? t.title : null);
+    // Usa o rótulo explícito reconhecido pelo parser; nunca converte o mercado desconhecido em vencedor.
+    const mercadoDoTitulo = t.title ? t.title.match(ROTULO_COM_DETALHE) : null;
+    const mercadoMensagem = mercado || (mercadoDoTitulo ? `${mercadoDoTitulo[1]}: ${mercadoDoTitulo[2]}` : null)
+      || (t.title && PARECE_MERCADO.test(t.title) ? t.title : null);
     const inicioMs = inicioDaPartida(metaEvento, t.conditionId);
     const campeonatoMensagem = normalizarCampeonato(metaEvento && metaEvento.campeonato)
       || normalizarCampeonato(campeonato)
       || campeonatosPorEvento.get(String(t.eventSlug || "").trim())
       || null;
-    // Sem título personalizado: tudo é texto simples para facilitar copiar a mensagem.
     const titulo = "";
     const linhas = [
-      `${nomeCarteira} — ${moeda(g.custo)}`,
+      `${nomeCarteira} — ${venda ? "Venda bruta" : "Compra"}: ${moeda(g.custo)}`,
       "",
       formatarLinhaMercado(mercadoMensagem, t.outcome),
       "",
-      `Odd da compra: ${odd}`,
+      venda ? `Preço médio da venda: ${moeda(pm)} por cota` : `Odd da compra: ${odd}`,
       `Horário da aposta: ${horaBrasilia(g.ms)}`,
       campeonatoMensagem ? `Campeonato: ${campeonatoMensagem}` : null,
       inicioMs ? `Início da partida: ${horaBrasilia(inicioMs).slice(0, 5)}` : null,
@@ -837,7 +837,6 @@ async function vigiar(env) {
         if (!nomeSubstituto) throw new Error("confronto nao identificado; recusando criar topico com nome de mercado");
         const replacement = await criarTopico(env, nomeSubstituto, orcamento);
         topicos[prepared.keyTopic] = { id: replacement, nome: nomeSubstituto };
-        // Tente persistir o tópico substituto antes de marcar a notificação como entregue.
         await env.CFG.put(TOPICOS, JSON.stringify(topicos));
         topicId = replacement;
         result = await avisar(env, titulo, corpo, "", topicId, orcamento);
@@ -859,7 +858,6 @@ async function vigiar(env) {
     flags.dirty = true;
   }
 
-  // Checkpoint em lote para evitar escrita KV a cada minuto sem novas operacoes.
   const precisaCheckpoint = nowSec - (Number(state.checkpointAt) || nowSec) >= CHECKPOINT_INTERVAL_SECONDS;
   if (precisaCheckpoint) flags.dirty = true;
   if (flags.dirty) {
@@ -872,7 +870,6 @@ async function vigiar(env) {
     try {
       await env.CFG.put(ESTADO, JSON.stringify(state));
     } catch (e) {
-      // At-least-once: se o envio já foi aceito pelo Telegram, o próximo ciclo pode repetir a mensagem.
       console.error("KV estado: gravacao falhou; fila antiga preservada onde o KV permitir: " + limpar(env, e));
     }
   } else {
@@ -887,7 +884,6 @@ async function vigiar(env) {
   resumo.v1 = flags.pagesV1;
   console.log(`novos=${resumo.novos} trades=${resumo.trades} erros=${resumo.erros} | rodada ` + JSON.stringify(resumo));
 
-  // Alerta operacional limitado a uma vez por quarto de hora.
   if (resumo.erros > 0 && Math.floor(nowSec / 60) % 15 === 0 && orcamento.total < MAX_TOTAL_FETCHES) {
     await avisar(env, "Falha parcial de monitoramento",
       `${resumo.erros} consulta(s) falharam nesta rodada. Veja os logs do Worker; a fila pendente foi mantida.`, "", null, orcamento);
@@ -960,9 +956,6 @@ export default {
       return jsonResp({ ok: false, error: "nao foi possivel salvar a configuracao no KV" }, 503);
     }
 
-    // A limpeza do estado de carteiras removidas acontece dentro do Cron, junto da gravação de estado,
-    // para evitar duas rotinas escrevendo a mesma chave KV simultaneamente.
-
     let aviso = null;
     if (carteiras.length) {
       aviso = (await avisar(env, "Servidor sincronizado",
@@ -971,7 +964,6 @@ export default {
     return jsonResp({ ok: true, carteiras: carteiras.length, aviso });
   },
   async scheduled(event, env, ctx) {
-    // Protege contra sobreposição no mesmo isolate; KV não oferece lock/compare-and-swap global.
     if (scheduledRunning) {
       console.warn("rodada ignorada: outra execucao ainda esta ativa neste isolate");
       return;
